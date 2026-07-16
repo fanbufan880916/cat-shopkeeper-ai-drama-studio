@@ -1,0 +1,10 @@
+# 首次运行“安装工作台.cmd”后，会根据实际解压目录自动生成 config.toml。
+[mcp_servers.cat_studio]
+command = "npm.cmd"
+args = ["run", "mcp"]
+cwd = "__WORKBENCH_ROOT__"
+startup_timeout_sec = 60
+
+[agents]
+max_threads = 8
+max_depth = 1

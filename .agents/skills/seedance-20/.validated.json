@@ -1,0 +1,10 @@
+﻿{
+    "name":  "seedance-20",
+    "version":  "6.6.0",
+    "source":  "https://github.com/Emily2040/seedance-2.0",
+    "commitHash":  "57d01dc66f93ecb03c2475be5f22dc416d9b701d",
+    "checksum":  "8b78186b264c13e69a59d7060f523a90416c9ac033da7db41e182231f630aa4f",
+    "valid":  true,
+    "details":  "Vendored upstream snapshot. Full v6.6 validation suite passed: structure, content, schemas, sources, state, continuity, sequence, behavior, generation, lint, unit tests and compile checks.",
+    "updatedAt":  "2026-07-16T06:03:11.3324659Z"
+}

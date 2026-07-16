@@ -1,0 +1,4 @@
+interface:
+  display_name: "豆包影视音频生成"
+  short_description: "按已锁定剧本生成对白、环境声、音乐和音效提示词"
+  default_prompt: "使用 $doubao-audio-generation 按剧本已确认的时代、地域、语言、口音和表演方式生成结构化音频提示词；只有剧本明确要求90年代香港电影时才使用港式普通话。"

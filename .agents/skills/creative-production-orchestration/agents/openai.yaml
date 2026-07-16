@@ -1,0 +1,4 @@
+interface:
+  display_name: "影视创作总导演"
+  short_description: "锁定内容模式、受众与视觉风格，调度电影级短片、广告和MV流程"
+  default_prompt: "使用 $creative-production-orchestration 先建立创作档案，再按内容模式和已确认视觉风格推进剧本、分镜、资产、样片与交付。未知视觉风格必须先审核。"

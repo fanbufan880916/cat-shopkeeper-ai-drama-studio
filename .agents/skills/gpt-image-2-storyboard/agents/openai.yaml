@@ -1,0 +1,4 @@
+interface:
+  display_name: "GPT-Image-2 漫剧生图"
+  short_description: "为角色资产、场景资产和电影分镜首帧生成并检查专业提示词"
+  default_prompt: "使用 gpt-image-2-storyboard 为当前漫剧资产或镜头编写可生成、可复现的提示词。"

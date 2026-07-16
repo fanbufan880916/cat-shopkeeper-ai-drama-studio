@@ -1,0 +1,10 @@
+﻿{
+    "name":  "doubao-audio-generation",
+    "version":  "1.0.0",
+    "source":  "Volcengine Doubao official prompt patterns",
+    "commitHash":  "",
+    "checksum":  "e72b27946b8a84373a8c5278b74182510ce28167e425e081b3ed5df49e6eb287",
+    "valid":  true,
+    "details":  "Skill structure and positive/negative audio prompt lint regression tests passed.",
+    "updatedAt":  "2026-07-16T06:03:08.0187792Z"
+}
