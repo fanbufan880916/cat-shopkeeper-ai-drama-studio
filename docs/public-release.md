@@ -23,11 +23,21 @@
 
 ## 使用者操作
 
-1. 安装 Node.js 22+ 和 FFmpeg。
-2. 双击 `安装工作台.cmd`。
-3. 在 Codex 中打开项目目录。
-4. 双击 `启动工作台.cmd`。
-5. 在 API 设置中填写自己的 Key；没有 Key 时保持 Mock。
+1. 安装 Git、Node.js 22+ 和 FFmpeg。
+2. 推荐用 `git clone https://github.com/fanbufan880916/cat-shopkeeper-ai-drama-studio.git` 安装；ZIP 安装不能使用工作台内的一键更新。
+3. 双击 `安装工作台.cmd`。
+4. 在 Codex 中打开项目目录。
+5. 双击 `启动工作台.cmd`。
+6. 按首次新人指引完成工作台认识；以后可从右上角重新打开。
+7. 在 API 设置中填写自己的 Key；没有 Key 时保持 Mock。
+
+## 一键更新边界
+
+- 更新入口只读取当前 GitHub `origin` 和当前分支的上游分支。
+- 更新前先运行 Git 状态检查；存在未提交源码修改时停止，不执行覆盖、重置或强制合并。
+- 只使用 `git pull --ff-only`，本地与远端分叉时交给人工处理。
+- 拉取后按需安装依赖并重新构建；服务端改动需要重新双击 `启动工作台.cmd` 才会生效。
+- `.data`、`.backups`、媒体、上传文件和本机密钥都被 Git 忽略，不参与更新。
 
 ## 重要限制
 

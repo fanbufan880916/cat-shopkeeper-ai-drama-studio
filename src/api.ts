@@ -1,4 +1,5 @@
 import type { DashboardData, Project } from "../shared/types";
+import type { WorkbenchUpdateStatus } from "../shared/workbench-update";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { ...(options?.headers as Record<string, string> | undefined) };
@@ -29,6 +30,17 @@ async function uploadForm<T>(url: string, fields: Record<string, string>, file?:
 }
 
 export const api = {
+  updateStatus: () => request<WorkbenchUpdateStatus>("/api/system/update-status"),
+  checkUpdate: () => request<WorkbenchUpdateStatus>("/api/system/check-update", {
+    method: "POST",
+    headers: { "x-workbench-update-confirm": "check-github" },
+    signal: AbortSignal.timeout(60_000)
+  }),
+  applyUpdate: () => request<WorkbenchUpdateStatus>("/api/system/apply-update", {
+    method: "POST",
+    headers: { "x-workbench-update-confirm": "pull-latest" },
+    signal: AbortSignal.timeout(10 * 60_000)
+  }),
   projects: () => request<Project[]>("/api/projects"),
   project: (id: string) => request<DashboardData>(`/api/projects/${id}`),
   createProject: (body: unknown) => request<Project>("/api/projects", { method: "POST", body: JSON.stringify(body) }),
@@ -38,6 +50,8 @@ export const api = {
   review: (projectId: string, body: unknown) => request(`/api/projects/${projectId}/reviews`, { method: "POST", body: JSON.stringify(body) }),
   saveAsset: (projectId: string, body: unknown) => request(`/api/projects/${projectId}/assets`, { method: "POST", body: JSON.stringify(body) }),
   uploadAssetReference: (assetId: string, file: File) => upload<{ ok: true; mediaId: string }>(`/api/assets/${assetId}/reference`, file),
+  selectAssetReference: (assetId: string, mediaId: string) => request<{ ok: true; mediaId: string }>(`/api/assets/${assetId}/reference/select`, { method: "POST", body: JSON.stringify({ mediaId }) }),
+  lockAssetImage: (assetId: string, jobId: string, mediaId: string) => request<{ ok: true; jobId: string; mediaId: string }>(`/api/assets/${assetId}/lock-image`, { method: "POST", body: JSON.stringify({ jobId, mediaId }) }),
   reviewAsset: (assetId: string, body: { decision: "approved" | "rejected"; feedback: string }) => request(`/api/assets/${assetId}/review`, { method: "POST", body: JSON.stringify(body) }),
   createCodexImageRequest: (assetId: string, body: { prompt: string; aspectRatio: string; quality: "standard" | "high"; count: number }) => request(`/api/assets/${assetId}/codex-image-requests`, { method: "POST", body: JSON.stringify(body) }),
   saveShot: (projectId: string, body: unknown) => request(`/api/projects/${projectId}/shots`, { method: "POST", body: JSON.stringify(body) }),
@@ -54,7 +68,7 @@ export const api = {
   createJob: (projectId: string, body: unknown) => request(`/api/projects/${projectId}/jobs`, { method: "POST", body: JSON.stringify(body) }),
   retryJob: (jobId: string) => request(`/api/jobs/${jobId}/retry`, { method: "POST" }),
   sampleApproval: (projectId: string, body: unknown) => request(`/api/projects/${projectId}/sample-approval`, { method: "POST", body: JSON.stringify(body) }),
-  preview: (projectId: string) => request<{ localPath: string; url: string }>(`/api/projects/${projectId}/preview`, { method: "POST" }),
+  preview: (projectId: string) => request<{ artifactId: string; localPath: string; url: string }>(`/api/projects/${projectId}/preview`, { method: "POST" }),
   settings: () => request<{ hasApiKey: boolean; hasVolcengineAudioApiKey: boolean; imageModel: string; imageResolution: string; videoModel: string; audioModel: string; defaultProvider: "mock" | "apimart" }>("/api/settings"),
   saveSettings: (body: unknown) => request("/api/settings", { method: "PUT", body: JSON.stringify(body) }),
   testSettings: (provider: "mock" | "apimart" | "volcengine_audio", apiKey?: string) => request<{ ok: boolean; message: string }>("/api/settings/test", { method: "POST", body: JSON.stringify({ provider, apiKey }) })

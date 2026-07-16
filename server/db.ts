@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', template TEXT NOT NULL,
   aspect_ratio TEXT NOT NULL, target_duration INTEGER NOT NULL,
   content_mode TEXT NOT NULL DEFAULT 'short_film', target_platform TEXT NOT NULL DEFAULT 'douyin',
+  target_audience TEXT NOT NULL DEFAULT '', creative_purpose TEXT NOT NULL DEFAULT '', target_emotion TEXT NOT NULL DEFAULT '',
   visual_style_status TEXT NOT NULL DEFAULT 'needs_review', visual_style_json TEXT NOT NULL DEFAULT '{}', stage TEXT NOT NULL,
   internal_revision_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
@@ -107,8 +108,20 @@ const projectColumns = db.prepare("PRAGMA table_info(projects)").all() as { name
 const addProjectColumn = (name: string, definition: string) => { if (!projectColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE projects ADD COLUMN ${name} ${definition}`); };
 addProjectColumn("content_mode", "TEXT NOT NULL DEFAULT 'short_film'");
 addProjectColumn("target_platform", "TEXT NOT NULL DEFAULT 'douyin'");
+addProjectColumn("target_audience", "TEXT NOT NULL DEFAULT ''");
+addProjectColumn("creative_purpose", "TEXT NOT NULL DEFAULT ''");
+addProjectColumn("target_emotion", "TEXT NOT NULL DEFAULT ''");
 addProjectColumn("visual_style_status", "TEXT NOT NULL DEFAULT 'needs_review'");
 addProjectColumn("visual_style_json", "TEXT NOT NULL DEFAULT '{}'");
+
+const legacyProjectProfiles = db.prepare("SELECT id,description,target_audience,creative_purpose FROM projects").all() as Array<{ id: string; description: string; target_audience: string; creative_purpose: string }>;
+const updateLegacyProjectProfile = db.prepare("UPDATE projects SET target_audience=?,creative_purpose=? WHERE id=?");
+for (const project of legacyProjectProfiles) {
+  const lines = project.description.split(/\r?\n/).map((line) => line.trim());
+  const audience = project.target_audience || lines.find((line) => line.startsWith("目标受众："))?.slice("目标受众：".length).trim() || "";
+  const purpose = project.creative_purpose || lines.find((line) => line.startsWith("创作目的："))?.slice("创作目的：".length).trim() || "";
+  if (audience !== project.target_audience || purpose !== project.creative_purpose) updateLegacyProjectProfile.run(audience, purpose, project.id);
+}
 
 // The previous workbench release treated the existing cat-shopkeeper project as a
 // Hong Kong 90s project. Preserve those files as history, but remove them from
@@ -188,7 +201,8 @@ function projectFrom(row: Record<string, unknown>): Project {
   return {
     id: String(row.id), name: String(row.name), description: String(row.description), template: String(row.template),
     aspectRatio: String(row.aspect_ratio), targetDuration: Number(row.target_duration), contentMode: (row.content_mode ?? "short_film") as ContentMode,
-    targetPlatform: String(row.target_platform ?? "douyin"), visualStyle, stage: row.stage as WorkflowStage,
+    targetPlatform: String(row.target_platform ?? "douyin"), targetAudience: String(row.target_audience ?? ""),
+    creativePurpose: String(row.creative_purpose ?? ""), targetEmotion: String(row.target_emotion ?? ""), visualStyle, stage: row.stage as WorkflowStage,
     internalRevisionCount: Number(row.internal_revision_count), createdAt: String(row.created_at), updatedAt: String(row.updated_at)
   };
 }
@@ -262,21 +276,23 @@ export const store = {
     if (!row) throw new Error("项目不存在。");
     return projectFrom(row);
   },
-  createProject(input: { name: string; description?: string; template?: string; aspectRatio?: string; targetDuration?: number; contentMode?: ContentMode; targetPlatform?: string; visualStyle?: VisualStyleProfile }) {
+  createProject(input: { name: string; description?: string; template?: string; aspectRatio?: string; targetDuration?: number; contentMode?: ContentMode; targetPlatform?: string; targetAudience?: string; creativePurpose?: string; targetEmotion?: string; visualStyle?: VisualStyleProfile }) {
     const defaultVisualStyle = input.visualStyle ?? (process.env.NODE_ENV === "test" ? { status: "locked" as const, name: "测试用现代现实主义", descriptors: ["测试"], evidence: "仅用于自动化测试。", source: "user" as const, sourceArtifactId: null } : inferVisualStyleProfile(""));
     const project: Project = { id: id("prj"), name: input.name, description: input.description ?? "", template: input.template ?? "90秒竖屏",
       aspectRatio: input.aspectRatio ?? "9:16", targetDuration: input.targetDuration ?? 90, contentMode: input.contentMode ?? "short_film", targetPlatform: input.targetPlatform ?? "douyin",
+      targetAudience: input.targetAudience ?? "", creativePurpose: input.creativePurpose ?? "", targetEmotion: input.targetEmotion ?? "",
       visualStyle: defaultVisualStyle, stage: "idea", internalRevisionCount: 0, createdAt: now(), updatedAt: now() };
-    db.prepare("INSERT INTO projects (id,name,description,template,aspect_ratio,target_duration,content_mode,target_platform,visual_style_status,visual_style_json,stage,internal_revision_count,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+    db.prepare("INSERT INTO projects (id,name,description,template,aspect_ratio,target_duration,content_mode,target_platform,target_audience,creative_purpose,target_emotion,visual_style_status,visual_style_json,stage,internal_revision_count,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
       project.id, project.name, project.description, project.template, project.aspectRatio, project.targetDuration, project.contentMode, project.targetPlatform,
-      project.visualStyle.status, asJson(project.visualStyle), project.stage, project.internalRevisionCount, project.createdAt, project.updatedAt);
+      project.targetAudience, project.creativePurpose, project.targetEmotion, project.visualStyle.status, asJson(project.visualStyle), project.stage, project.internalRevisionCount, project.createdAt, project.updatedAt);
     return project;
   },
-  setCreativeProfile(projectId: string, input: { contentMode?: ContentMode; targetPlatform?: string; visualStyle?: VisualStyleProfile }) {
+  setCreativeProfile(projectId: string, input: { contentMode?: ContentMode; targetPlatform?: string; targetAudience?: string; creativePurpose?: string; targetEmotion?: string; visualStyle?: VisualStyleProfile }) {
     const current = this.getProject(projectId);
     const visualStyle = input.visualStyle ?? current.visualStyle;
-    db.prepare("UPDATE projects SET content_mode=?,target_platform=?,visual_style_status=?,visual_style_json=?,updated_at=? WHERE id=?").run(
-      input.contentMode ?? current.contentMode, input.targetPlatform ?? current.targetPlatform, visualStyle.status, asJson(visualStyle), now(), projectId);
+    db.prepare("UPDATE projects SET content_mode=?,target_platform=?,target_audience=?,creative_purpose=?,target_emotion=?,visual_style_status=?,visual_style_json=?,updated_at=? WHERE id=?").run(
+      input.contentMode ?? current.contentMode, input.targetPlatform ?? current.targetPlatform, input.targetAudience ?? current.targetAudience,
+      input.creativePurpose ?? current.creativePurpose, input.targetEmotion ?? current.targetEmotion, visualStyle.status, asJson(visualStyle), now(), projectId);
     return this.getProject(projectId);
   },
   deleteProject(projectId: string) {

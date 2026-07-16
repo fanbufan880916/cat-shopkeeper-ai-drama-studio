@@ -20,7 +20,7 @@ export function buildPreview(projectId: string) {
   fs.mkdirSync(previewDir, { recursive: true });
   const listPath = path.join(previewDir, `${projectId}-concat.txt`);
   fs.writeFileSync(listPath, rows.map((row) => `file '${row.local_path.replaceAll("'", "'\\''")}'`).join("\n"), "utf8");
-  const outputPath = path.join(previewDir, `${projectId}-preview.mp4`);
+  const outputPath = path.join(previewDir, `${projectId}-preview-${Date.now()}.mp4`);
   execFileSync("ffmpeg", ["-y", "-f", "concat", "-safe", "0", "-i", listPath, "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2:black", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", outputPath], { windowsHide: true, stdio: "ignore" });
   return outputPath;
 }

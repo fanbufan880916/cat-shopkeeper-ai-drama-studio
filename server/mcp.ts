@@ -20,9 +20,9 @@ server.registerTool("list_projects", {
 
 server.registerTool("create_project", {
   description: "创建一个新的漫剧项目，默认90秒9:16竖屏。",
-  inputSchema: { name: z.string().min(1), description: z.string().default(""), targetDuration: z.number().int().min(15).max(1800).default(90), aspectRatio: z.string().default("9:16"), contentMode: z.enum(["short_film", "ad", "mv"]).default("short_film"), targetPlatform: z.string().default("douyin") }
+  inputSchema: { name: z.string().min(1), description: z.string().default(""), targetDuration: z.number().int().min(15).max(1800).default(90), aspectRatio: z.string().default("9:16"), contentMode: z.enum(["short_film", "ad", "mv"]).default("short_film"), targetPlatform: z.string().default("douyin"), targetAudience: z.string().optional(), creativePurpose: z.string().optional(), targetEmotion: z.string().optional() }
 }, async (input) => {
-  const project = store.createProject({ name: input.name, description: input.description, targetDuration: input.targetDuration, aspectRatio: input.aspectRatio, contentMode: input.contentMode, targetPlatform: input.targetPlatform });
+  const project = store.createProject({ name: input.name, description: input.description, targetDuration: input.targetDuration, aspectRatio: input.aspectRatio, contentMode: input.contentMode, targetPlatform: input.targetPlatform, targetAudience: input.targetAudience, creativePurpose: input.creativePurpose, targetEmotion: input.targetEmotion });
   emitEvent("project.updated", { projectId: project.id });
   return result(project);
 });
@@ -33,6 +33,9 @@ server.registerTool("set_creative_profile", {
     projectId: z.string(),
     contentMode: z.enum(["short_film", "ad", "mv"]).optional(),
     targetPlatform: z.string().min(1).optional(),
+    targetAudience: z.string().optional(),
+    creativePurpose: z.string().optional(),
+    targetEmotion: z.string().optional(),
     visualStyle: z.object({
       status: z.enum(["needs_review", "locked"]),
       name: z.string().default(""),

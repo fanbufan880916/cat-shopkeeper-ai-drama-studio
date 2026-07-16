@@ -46,6 +46,9 @@ export interface Project {
   targetDuration: number;
   contentMode: ContentMode;
   targetPlatform: string;
+  targetAudience: string;
+  creativePurpose: string;
+  targetEmotion: string;
   visualStyle: VisualStyleProfile;
   stage: WorkflowStage;
   internalRevisionCount: number;
@@ -252,11 +255,11 @@ export interface DashboardData {
 export const stageLabels: Record<WorkflowStage, string> = {
   idea: "创意",
   script_internal_review: "剧本内部审核",
-  script_user_review: "用户审剧本",
+  script_user_review: "剧本审核",
   asset_design: "资产设计",
-  asset_user_review: "用户审资产",
+  asset_user_review: "资产审核",
   storyboard_design: "分镜生产",
-  storyboard_user_review: "用户审分镜",
+  storyboard_user_review: "完整分镜审核",
   sample_image: "样片生图",
   sample_video: "样片视频",
   batch_generation: "批量生成",

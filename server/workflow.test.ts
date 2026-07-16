@@ -17,7 +17,7 @@ describe("workflow guards", () => {
   it("blocks real generation until the visual style is locked", () => {
     const project = {
       id: "p", name: "test", description: "", template: "", aspectRatio: "9:16", targetDuration: 30,
-      contentMode: "short_film" as const, targetPlatform: "douyin",
+      contentMode: "short_film" as const, targetPlatform: "douyin", targetAudience: "", creativePurpose: "", targetEmotion: "",
       visualStyle: { status: "needs_review" as const, name: "", descriptors: [], evidence: "", source: "none" as const, sourceArtifactId: null },
       stage: "sample_image" as const, internalRevisionCount: 0, createdAt: "", updatedAt: ""
     };

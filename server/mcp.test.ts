@@ -29,6 +29,20 @@ describe("MCP bridge", () => {
     expect(response.isError).not.toBe(true);
   }, 20_000);
 
+  it("keeps new creative goal fields optional in MCP tools", async () => {
+    const tools = await client.listTools();
+    for (const name of ["create_project", "set_creative_profile"]) {
+      const tool = tools.tools.find((item) => item.name === name);
+      expect(tool).toBeDefined();
+      const properties = (tool?.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+      expect(Object.keys(properties)).toEqual(expect.arrayContaining(["targetAudience", "creativePurpose", "targetEmotion"]));
+      const required = (tool?.inputSchema as { required?: string[] }).required ?? [];
+      expect(required).not.toContain("targetAudience");
+      expect(required).not.toContain("creativePurpose");
+      expect(required).not.toContain("targetEmotion");
+    }
+  }, 20_000);
+
   it("reports all four validated project skills", async () => {
     const response = await client.callTool({ name: "get_skill_status", arguments: {} });
     expect(response.isError).not.toBe(true);

@@ -20,11 +20,15 @@ import { assertGateAllowed, assertVisualStyleLocked, scoresPass } from "./workfl
 import { assertNoActiveImageGeneration } from "./image-generation-lock.js";
 import { cutAudioClip } from "./audio-clips.js";
 import { inferAudioStyleProfile, validateAudioPrompt } from "../shared/audio-prompt.js";
+import { applyWorkbenchUpdate, inspectWorkbenchUpdate } from "./workbench-update.js";
+
+let updateInProgress = false;
 
 const projectSchema = z.object({
   name: z.string().min(1), description: z.string().optional(), template: z.string().optional(),
   aspectRatio: z.string().optional(), targetDuration: z.number().int().min(15).max(1800).optional(),
-  contentMode: z.enum(["short_film", "ad", "mv"]).optional(), targetPlatform: z.string().min(1).optional()
+  contentMode: z.enum(["short_film", "ad", "mv"]).optional(), targetPlatform: z.string().min(1).optional(),
+  targetAudience: z.string().optional(), creativePurpose: z.string().optional(), targetEmotion: z.string().optional()
 });
 
 const artifactSchema = z.object({
@@ -58,8 +62,46 @@ function stageForArtifact(type: ArtifactType): WorkflowStage | null {
   return null;
 }
 
+function invalidateShotsUsingAsset(projectId: string, assetId: string) {
+  const stamp = now();
+  db.prepare(`
+    UPDATE shots
+    SET status='stale', sample_approved=0,
+        approved_image_job_id=NULL, approved_image_media_id=NULL, approved_video_job_id=NULL,
+        observed_end_state='', observed_audio_state='', last_frame_media_id=NULL, updated_at=?
+    WHERE project_id=?
+      AND EXISTS (SELECT 1 FROM json_each(shots.asset_ids_json) WHERE value=?)
+  `).run(stamp, projectId, assetId);
+}
+
 export async function registerRoutes(app: FastifyInstance) {
   app.get("/api/health", async () => ({ ok: true, name: "猫掌柜 AI 漫剧创作工作台", time: new Date().toISOString() }));
+
+  app.get("/api/system/update-status", async () => inspectWorkbenchUpdate());
+  app.post("/api/system/check-update", async (request, reply) => {
+    if (request.headers["x-workbench-update-confirm"] !== "check-github") {
+      return reply.code(403).send({ error: "更新检查请求未通过本机安全确认。" });
+    }
+    if (updateInProgress) return reply.code(409).send({ error: "工作台正在执行更新，请稍候。" });
+    updateInProgress = true;
+    try {
+      return await inspectWorkbenchUpdate({ fetch: true });
+    } finally {
+      updateInProgress = false;
+    }
+  });
+  app.post("/api/system/apply-update", async (request, reply) => {
+    if (request.headers["x-workbench-update-confirm"] !== "pull-latest") {
+      return reply.code(403).send({ error: "更新请求未通过本机安全确认。" });
+    }
+    if (updateInProgress) return reply.code(409).send({ error: "工作台正在执行更新，请不要重复点击。" });
+    updateInProgress = true;
+    try {
+      return await applyWorkbenchUpdate();
+    } finally {
+      updateInProgress = false;
+    }
+  });
 
   app.get("/api/events", async (_request, reply) => {
     reply.hijack();
@@ -89,6 +131,9 @@ export async function registerRoutes(app: FastifyInstance) {
     const body = z.object({
       contentMode: z.enum(["short_film", "ad", "mv"]).optional(),
       targetPlatform: z.string().min(1).optional(),
+      targetAudience: z.string().optional(),
+      creativePurpose: z.string().optional(),
+      targetEmotion: z.string().optional(),
       visualStyle: z.object({
         status: z.enum(["needs_review", "locked"]),
         name: z.string().default(""),
@@ -97,7 +142,7 @@ export async function registerRoutes(app: FastifyInstance) {
         source: z.enum(["script", "user", "style_asset", "none"]).default("user"),
         sourceArtifactId: z.string().nullable().default(null)
       }).optional()
-    }).parse(request.body) as { contentMode?: ContentMode; targetPlatform?: string; visualStyle?: VisualStyleProfile };
+    }).parse(request.body) as { contentMode?: ContentMode; targetPlatform?: string; targetAudience?: string; creativePurpose?: string; targetEmotion?: string; visualStyle?: VisualStyleProfile };
     const visualStyle = body.visualStyle ? { ...body.visualStyle, source: body.visualStyle.source ?? "user" } : current.visualStyle;
     const project = store.setCreativeProfile(projectId, { ...body, visualStyle });
     emitEvent("project.updated", { projectId });
@@ -134,6 +179,11 @@ export async function registerRoutes(app: FastifyInstance) {
     if (body.gate === "audience" && !approvedReviewExists(projectId, "director", body.artifactId!)) {
       throw new Error("当前剧本版本尚未通过总导演审核，不能提交观众审核。");
     }
+    if (body.gate === "final_user") {
+      const currentExport = latestArtifact(projectId, "final_export");
+      if (!currentExport) throw new Error("当前还没有可审核的预览片版本。");
+      if (!body.artifactId || body.artifactId !== String(currentExport.id)) throw new Error("最终审核必须绑定当前最新预览片版本。");
+    }
     if ((body.gate === "director" || body.gate === "audience") && body.decision === "approved" && !scoresPass(body.scores)) {
       throw new Error("内部审核评分未达标：平均分需不低于4分，且任何关键项不能低于3分。");
     }
@@ -142,6 +192,10 @@ export async function registerRoutes(app: FastifyInstance) {
       if (!assets.length) throw new Error("当前项目还没有资产，不能完成资产审核。");
       const incomplete = assets.filter((asset) => asset.status !== "approved" || !asset.approved_job_id);
       if (incomplete.length) throw new Error(`还有 ${incomplete.length} 个资产没有逐项确认：${incomplete.slice(0, 4).map((asset) => asset.name).join("、")}${incomplete.length > 4 ? "等" : ""}。`);
+    }
+    if (body.gate === "storyboard_user" && body.decision === "approved") {
+      const shotCount = Number((db.prepare("SELECT COUNT(*) AS count FROM shots WHERE project_id=?").get(projectId) as { count: number }).count);
+      if (!shotCount) throw new Error("当前完整分镜没有镜头，不能通过审核。");
     }
     const review = store.addReview({ projectId, artifactId: body.artifactId ?? null, gate: body.gate, decision: body.decision, scores: body.scores, feedback: body.feedback });
     if (body.decision === "rejected") {
@@ -172,6 +226,7 @@ export async function registerRoutes(app: FastifyInstance) {
       const lockedImage = db.prepare("SELECT id FROM shots WHERE project_id=? AND approved_image_media_id IS NOT NULL LIMIT 1").get(projectId);
       store.setStage(projectId, lockedImage ? "sample_video" : "sample_image");
     } else if (body.gate === "final_user") {
+      if (body.artifactId) store.lockArtifact(body.artifactId);
       store.resolveOpenRevisions(projectId, "final");
       store.setStage(projectId, "completed");
     }
@@ -190,7 +245,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.post("/api/assets/:assetId/reference", async (request, reply) => {
     const { assetId } = request.params as { assetId: string };
-    const asset = db.prepare("SELECT id,project_id FROM assets WHERE id=?").get(assetId) as { id: string; project_id: string } | undefined;
+    const asset = db.prepare("SELECT id,project_id,reference_media_id FROM assets WHERE id=?").get(assetId) as { id: string; project_id: string; reference_media_id: string | null } | undefined;
     if (!asset) throw new Error("资产不存在。");
     const file = await request.file();
     if (!file) throw new Error("请选择要锁定的参考图片。");
@@ -202,14 +257,50 @@ export async function registerRoutes(app: FastifyInstance) {
     const mediaId = id("med");
     db.prepare("INSERT INTO media_files VALUES (?,?,?,?,?,?,?,?,?)").run(mediaId, asset.project_id, null, "image", localPath, "", null, JSON.stringify({ role: "locked_asset_reference", originalName: file.filename }), now());
     db.prepare("UPDATE assets SET reference_media_id=?,status=CASE WHEN status='draft' THEN 'draft' ELSE 'stale' END,approved_job_id=NULL,updated_at=? WHERE id=?").run(mediaId, now(), assetId);
+    if (asset.reference_media_id !== mediaId) invalidateShotsUsingAsset(asset.project_id, assetId);
     emitEvent("project.updated", { projectId: asset.project_id });
     return reply.code(201).send({ ok: true, mediaId });
+  });
+
+  app.post("/api/assets/:assetId/reference/select", async (request) => {
+    const { assetId } = request.params as { assetId: string };
+    const body = z.object({ mediaId: z.string().min(1) }).parse(request.body);
+    const asset = db.prepare("SELECT id,project_id,reference_media_id FROM assets WHERE id=?").get(assetId) as { id: string; project_id: string; reference_media_id: string | null } | undefined;
+    if (!asset) throw new Error("资产不存在。");
+    const media = db.prepare("SELECT id,project_id,job_id,kind FROM media_files WHERE id=?").get(body.mediaId) as { id: string; project_id: string; job_id: string | null; kind: string } | undefined;
+    if (!media || media.project_id !== asset.project_id || media.kind !== "image") throw new Error("所选图片不属于当前项目，或不是可用图片。");
+    if (!media.job_id) throw new Error("项目图库只允许选择已经生成的图片；本地图片请使用上传入口。");
+    const job = db.prepare("SELECT id,project_id,kind,status FROM generation_jobs WHERE id=?").get(media.job_id) as { id: string; project_id: string; kind: string; status: string } | undefined;
+    if (!job || job.project_id !== asset.project_id || job.kind !== "image" || job.status !== "completed") throw new Error("所选图片的生成任务尚未完成，不能设为参考图。");
+    db.prepare("UPDATE assets SET reference_media_id=?,status=CASE WHEN status='draft' THEN 'draft' ELSE 'stale' END,approved_job_id=NULL,updated_at=? WHERE id=?").run(media.id, now(), assetId);
+    if (asset.reference_media_id !== media.id) invalidateShotsUsingAsset(asset.project_id, assetId);
+    emitEvent("project.updated", { projectId: asset.project_id });
+    return { ok: true, mediaId: media.id };
+  });
+
+  app.post("/api/assets/:assetId/lock-image", async (request) => {
+    const { assetId } = request.params as { assetId: string };
+    const body = z.object({ jobId: z.string().min(1), mediaId: z.string().min(1) }).parse(request.body);
+    const asset = db.prepare("SELECT id,project_id,reference_media_id FROM assets WHERE id=?").get(assetId) as { id: string; project_id: string; reference_media_id: string | null } | undefined;
+    if (!asset) throw new Error("资产不存在。");
+    const stage = store.getProject(asset.project_id).stage;
+    if (!["asset_design", "asset_user_review"].includes(stage)) throw new Error("当前阶段不能锁定资产主图。");
+    const job = db.prepare("SELECT id,project_id,asset_id,kind,status FROM generation_jobs WHERE id=?").get(body.jobId) as { id: string; project_id: string; asset_id: string | null; kind: string; status: string } | undefined;
+    if (!job || job.project_id !== asset.project_id || job.asset_id !== assetId || job.kind !== "image") throw new Error("所选生图任务不属于当前资产。");
+    if (job.status !== "completed") throw new Error("这张图片尚未生成完成，不能锁定。");
+    const media = db.prepare("SELECT id FROM media_files WHERE id=? AND project_id=? AND job_id=? AND kind='image'").get(body.mediaId, asset.project_id, job.id) as { id: string } | undefined;
+    if (!media) throw new Error("所选图片不存在，或不属于这次生图任务。");
+    db.prepare("UPDATE assets SET status='approved',approved_job_id=?,reference_media_id=?,updated_at=? WHERE id=?").run(job.id, media.id, now(), assetId);
+    if (asset.reference_media_id !== media.id) invalidateShotsUsingAsset(asset.project_id, assetId);
+    store.resolveOpenRevisions(asset.project_id, "asset", assetId);
+    emitEvent("project.updated", { projectId: asset.project_id });
+    return { ok: true, jobId: job.id, mediaId: media.id };
   });
 
   app.post("/api/assets/:assetId/review", async (request) => {
     const { assetId } = request.params as { assetId: string };
     const body = z.object({ decision: z.enum(["approved", "rejected"]), feedback: z.string().default("") }).parse(request.body);
-    const asset = db.prepare("SELECT id,project_id,name FROM assets WHERE id=?").get(assetId) as { id: string; project_id: string; name: string } | undefined;
+    const asset = db.prepare("SELECT id,project_id,name,reference_media_id FROM assets WHERE id=?").get(assetId) as { id: string; project_id: string; name: string; reference_media_id: string | null } | undefined;
     if (!asset) throw new Error("资产不存在。");
     const stage = store.getProject(asset.project_id).stage;
     if (!["asset_design", "asset_user_review"].includes(stage)) throw new Error("当前阶段不能审核资产。");
@@ -221,6 +312,7 @@ export async function registerRoutes(app: FastifyInstance) {
       const approvedMedia = db.prepare("SELECT id FROM media_files WHERE job_id=? AND kind='image' ORDER BY created_at ASC LIMIT 1").get(latestJob.id) as { id: string } | undefined;
       if (!approvedMedia) throw new Error("该生图任务没有可用的本地图片，请刷新任务状态后重试。");
       db.prepare("UPDATE assets SET status='approved',approved_job_id=?,reference_media_id=?,updated_at=? WHERE id=?").run(latestJob.id, approvedMedia.id, now(), assetId);
+      if (asset.reference_media_id !== approvedMedia.id) invalidateShotsUsingAsset(asset.project_id, assetId);
       store.resolveOpenRevisions(asset.project_id, "asset", assetId);
     } else {
       if (!body.feedback.trim()) throw new Error("退回资产时必须填写具体修改意见。");
@@ -679,9 +771,12 @@ export async function registerRoutes(app: FastifyInstance) {
     if (!counts.total) throw new Error("当前项目还没有分镜，不能生成成片预览。");
     if (counts.approved !== counts.total) throw new Error(`还有 ${counts.total - counts.approved} 个镜头视频未通过审核，不能提前生成成片。`);
     const localPath = buildPreview(projectId);
+    const createdAt = now();
+    const url = `/api/files?path=${encodeURIComponent(localPath)}`;
+    const artifact = store.addArtifact(projectId, { type: "final_export", title: `成片预览 · ${createdAt}`, content: { localPath, url, createdAt }, status: "review", createdBy: "preview-builder" });
     store.setStage(projectId, "final_review");
     emitEvent("project.updated", { projectId });
-    return { localPath, url: `/api/files?path=${encodeURIComponent(localPath)}` };
+    return { artifactId: artifact.id, localPath, url };
   });
 
   app.get("/api/assets/:assetId/reference", async (request, reply) => {

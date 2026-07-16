@@ -1,11 +1,28 @@
 import fs from "node:fs";
 import path from "node:path";
 import Fastify from "fastify";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { registerRoutes } from "./routes.js";
 import { db, store } from "./db.js";
 import { encryptSecret } from "./crypto.js";
 import { dbPath, rootDir } from "./paths.js";
+
+vi.mock("./preview.js", () => ({ buildPreview: vi.fn((projectId: string) => `C:\\preview\\${projectId}-${Date.now()}.mp4`) }));
+vi.mock("./workbench-update.js", () => ({
+  inspectWorkbenchUpdate: vi.fn(async ({ fetch = false }: { fetch?: boolean } = {}) => ({
+    version: "0.2.0", state: fetch ? "available" : "current", branch: "main", upstream: "origin/main",
+    repositoryUrl: "https://github.com/example/workbench", localCommit: "111111111111", remoteCommit: "222222222222",
+    ahead: 0, behind: fetch ? 1 : 0, dirty: false, updateAvailable: fetch, canUpdate: fetch,
+    message: fetch ? "发现 1 个 GitHub 更新，可以安全拉取。" : "当前已经是 GitHub 最新版本。", checkedAt: new Date().toISOString()
+  })),
+  applyWorkbenchUpdate: vi.fn(async () => ({
+    version: "0.2.0", state: "current", branch: "main", upstream: "origin/main",
+    repositoryUrl: "https://github.com/example/workbench", localCommit: "222222222222", remoteCommit: "222222222222",
+    ahead: 0, behind: 0, dirty: false, updateAvailable: false, canUpdate: false,
+    message: "更新内容已经拉取并完成构建。", checkedAt: new Date().toISOString(),
+    buildCompleted: true, restartRequired: true
+  }))
+}));
 
 const app = Fastify({ logger: false });
 const testProjectIds: string[] = [];
@@ -21,6 +38,62 @@ afterAll(async () => {
   await app.close();
   const remove = db.prepare("DELETE FROM projects WHERE id=?");
   for (const projectId of testProjectIds) remove.run(projectId);
+});
+
+describe("workbench update routes", () => {
+  it("allows a read-only local status check", async () => {
+    const response = await app.inject({ method: "GET", url: "/api/system/update-status" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ version: "0.2.0", state: "current" });
+  });
+
+  it("requires the local confirmation header before network checks or updates", async () => {
+    const check = await app.inject({ method: "POST", url: "/api/system/check-update" });
+    const apply = await app.inject({ method: "POST", url: "/api/system/apply-update" });
+    expect(check.statusCode).toBe(403);
+    expect(apply.statusCode).toBe(403);
+  });
+
+  it("checks GitHub and applies an explicitly confirmed update", async () => {
+    const check = await app.inject({
+      method: "POST", url: "/api/system/check-update",
+      headers: { "x-workbench-update-confirm": "check-github" }
+    });
+    expect(check.json()).toMatchObject({ state: "available", canUpdate: true });
+    const apply = await app.inject({
+      method: "POST", url: "/api/system/apply-update",
+      headers: { "x-workbench-update-confirm": "pull-latest" }
+    });
+    expect(apply.json()).toMatchObject({ buildCompleted: true, restartRequired: true });
+  });
+});
+
+describe("project creative profile fields", () => {
+  it("stores the three new goal fields through project creation and profile updates", async () => {
+    const response = await app.inject({ method: "POST", url: "/api/projects", payload: {
+      name: `profile-fields-${Date.now()}`, description: "一条完整创意简报", contentMode: "ad",
+      targetPlatform: "xiaohongshu", targetDuration: 30, targetAudience: "本地年轻家庭",
+      creativePurpose: "引导购买团购券", targetEmotion: "先好奇，最后信任"
+    } });
+    expect(response.statusCode).toBe(201);
+    const project = response.json();
+    testProjectIds.push(project.id);
+    expect(project).toMatchObject({ targetAudience: "本地年轻家庭", creativePurpose: "引导购买团购券", targetEmotion: "先好奇，最后信任" });
+
+    const updated = await app.inject({ method: "PUT", url: `/api/projects/${project.id}/creative-profile`, payload: {
+      targetAudience: "六盘水本地用户", creativePurpose: "引导到店", targetEmotion: "安心"
+    } });
+    expect(updated.statusCode).toBe(200);
+    expect(updated.json()).toMatchObject({ targetAudience: "六盘水本地用户", creativePurpose: "引导到店", targetEmotion: "安心" });
+  });
+
+  it("continues accepting the old request body", async () => {
+    const response = await app.inject({ method: "POST", url: "/api/projects", payload: { name: `legacy-project-${Date.now()}` } });
+    expect(response.statusCode).toBe(201);
+    const project = response.json();
+    testProjectIds.push(project.id);
+    expect(project).toMatchObject({ targetAudience: "", creativePurpose: "", targetEmotion: "" });
+  });
 });
 
 describe("user script review", () => {
@@ -253,6 +326,78 @@ describe("asset-by-asset user review", () => {
     expect(updated.status).toBe("approved");
     expect(updated.approvedJobId).toBe(job.id);
     expect(updated.referenceMediaId).toBe(mediaId);
+  });
+
+  it("locks the exact generated image selected by the user", async () => {
+    const project = store.createProject({ name: `asset-image-lock-${Date.now()}` });
+    testProjectIds.push(project.id);
+    store.setStage(project.id, "asset_user_review");
+    const { asset, job, mediaId: firstMediaId } = createCompletedAsset(project.id, "Multi image asset");
+    const secondMediaId = `med_asset_second_${Date.now()}_${Math.random()}`;
+    db.prepare("INSERT INTO media_files VALUES (?,?,?,?,?,?,?,?,?)").run(secondMediaId, project.id, job.id, "image", `.data/media/${job.id}-2.png`, "", null, "{}", new Date().toISOString());
+
+    const response = await app.inject({ method: "POST", url: `/api/assets/${asset.id}/lock-image`, payload: { jobId: job.id, mediaId: secondMediaId } });
+
+    expect(response.statusCode).toBe(200);
+    const updated = store.dashboard(project.id).assets.find((item) => item.id === asset.id)!;
+    expect(updated.status).toBe("approved");
+    expect(updated.approvedJobId).toBe(job.id);
+    expect(updated.referenceMediaId).toBe(secondMediaId);
+    expect(updated.referenceMediaId).not.toBe(firstMediaId);
+  });
+
+  it("invalidates only storyboard shots that reference an asset whose main image changed", async () => {
+    const project = store.createProject({ name: `asset-lock-shot-isolation-${Date.now()}` });
+    testProjectIds.push(project.id);
+    store.setStage(project.id, "asset_user_review");
+    const target = createCompletedAsset(project.id, "Target asset");
+    const other = createCompletedAsset(project.id, "Other asset");
+    const affectedShot = store.upsertShot(project.id, { shotNumber: 1, title: "Affected", assetIds: [target.asset.id] });
+    const untouchedShot = store.upsertShot(project.id, { shotNumber: 2, title: "Untouched", assetIds: [other.asset.id] });
+    db.prepare("UPDATE shots SET status='approved',sample_approved=1,approved_image_job_id='img-job',approved_image_media_id='img-media',approved_video_job_id='vid-job',last_frame_media_id='tail-media' WHERE id IN (?,?)").run(affectedShot.id, untouchedShot.id);
+    db.prepare("UPDATE assets SET reference_media_id=? WHERE id=?").run(target.mediaId, target.asset.id);
+    const replacementMediaId = `med_asset_replacement_${Date.now()}_${Math.random()}`;
+    db.prepare("INSERT INTO media_files VALUES (?,?,?,?,?,?,?,?,?)").run(replacementMediaId, project.id, target.job.id, "image", `.data/media/${target.job.id}-replacement.png`, "", null, "{}", new Date().toISOString());
+
+    const response = await app.inject({ method: "POST", url: `/api/assets/${target.asset.id}/lock-image`, payload: { jobId: target.job.id, mediaId: replacementMediaId } });
+
+    expect(response.statusCode).toBe(200);
+    const dashboard = store.dashboard(project.id);
+    const affected = dashboard.shots.find((shot) => shot.id === affectedShot.id)!;
+    const untouched = dashboard.shots.find((shot) => shot.id === untouchedShot.id)!;
+    expect(affected).toMatchObject({ status: "stale", sampleApproved: false, approvedImageJobId: null, approvedImageMediaId: null, approvedVideoJobId: null, lastFrameMediaId: null });
+    expect(untouched).toMatchObject({ status: "approved", sampleApproved: true, approvedImageJobId: "img-job", approvedImageMediaId: "img-media", approvedVideoJobId: "vid-job", lastFrameMediaId: "tail-media" });
+  });
+
+  it("selects a completed project image as a generation reference without approving the asset", async () => {
+    const project = store.createProject({ name: `asset-project-library-${Date.now()}` });
+    testProjectIds.push(project.id);
+    store.setStage(project.id, "asset_user_review");
+    const target = createCompletedAsset(project.id, "Target asset");
+    const source = createCompletedAsset(project.id, "Source asset");
+    await app.inject({ method: "POST", url: `/api/assets/${target.asset.id}/review`, payload: { decision: "approved", feedback: "" } });
+
+    const response = await app.inject({ method: "POST", url: `/api/assets/${target.asset.id}/reference/select`, payload: { mediaId: source.mediaId } });
+
+    expect(response.statusCode).toBe(200);
+    const updated = store.dashboard(project.id).assets.find((item) => item.id === target.asset.id)!;
+    expect(updated.referenceMediaId).toBe(source.mediaId);
+    expect(updated.status).toBe("stale");
+    expect(updated.approvedJobId).toBeNull();
+  });
+
+  it("rejects a project-library image from another project", async () => {
+    const project = store.createProject({ name: `asset-project-library-owner-${Date.now()}` });
+    const other = store.createProject({ name: `asset-project-library-foreign-${Date.now()}` });
+    testProjectIds.push(project.id, other.id);
+    store.setStage(project.id, "asset_user_review");
+    const target = createCompletedAsset(project.id, "Target asset");
+    const foreign = createCompletedAsset(other.id, "Foreign asset");
+
+    const response = await app.inject({ method: "POST", url: `/api/assets/${target.asset.id}/reference/select`, payload: { mediaId: foreign.mediaId } });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toContain("不属于当前项目");
   });
 
   it("rejects an asset only with specific feedback", async () => {
@@ -556,6 +701,53 @@ describe("final preview gate", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json().error).toContain("未通过审核");
     expect(store.getProject(project.id).stage).not.toBe("final_review");
+  });
+
+  it("persists preview artifacts and binds final approval to the latest version", async () => {
+    const project = store.createProject({ name: `preview-artifact-${Date.now()}` });
+    testProjectIds.push(project.id);
+    const first = store.addArtifact(project.id, { type: "final_export", title: "预览V1", content: { localPath: "one.mp4", url: "/one.mp4", createdAt: "2026-01-01T00:00:00.000Z" } });
+    const second = store.addArtifact(project.id, { type: "final_export", title: "预览V2", content: { localPath: "two.mp4", url: "/two.mp4", createdAt: "2026-01-02T00:00:00.000Z" } });
+    store.setStage(project.id, "final_review");
+
+    const oldVersion = await app.inject({ method: "POST", url: `/api/projects/${project.id}/reviews`, payload: { gate: "final_user", artifactId: first.id, decision: "approved", scores: {}, feedback: "" } });
+    expect(oldVersion.statusCode).toBe(400);
+    expect(oldVersion.json().error).toContain("最新预览片版本");
+
+    const approved = await app.inject({ method: "POST", url: `/api/projects/${project.id}/reviews`, payload: { gate: "final_user", artifactId: second.id, decision: "approved", scores: {}, feedback: "" } });
+    expect(approved.statusCode).toBe(201);
+    const dashboard = store.dashboard(project.id);
+    expect(dashboard.project.stage).toBe("completed");
+    expect(dashboard.artifacts.find((artifact) => artifact.id === second.id)?.status).toBe("locked");
+    expect(dashboard.artifacts.filter((artifact) => artifact.type === "final_export")).toHaveLength(2);
+  });
+
+  it("returns the persisted artifact id and restores the latest preview after refresh", async () => {
+    const project = store.createProject({ name: `preview-refresh-${Date.now()}` });
+    testProjectIds.push(project.id);
+    const shot = store.upsertShot(project.id, { shotNumber: 1, title: "镜头一" });
+    db.prepare("UPDATE shots SET approved_video_job_id=? WHERE id=?").run("job-approved-for-preview", shot.id);
+    const response = await app.inject({ method: "POST", url: `/api/projects/${project.id}/preview` });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ artifactId: expect.stringMatching(/^art_/), localPath: expect.stringContaining(project.id), url: expect.stringContaining("/api/files?path=") });
+    const refreshed = store.dashboard(project.id);
+    const latest = refreshed.artifacts.filter((artifact) => artifact.type === "final_export").sort((a, b) => b.version - a.version)[0];
+    expect(latest.id).toBe(response.json().artifactId);
+    expect(latest.content).toMatchObject({ localPath: response.json().localPath, url: response.json().url, createdAt: expect.any(String) });
+    expect(refreshed.project.stage).toBe("final_review");
+  });
+});
+
+describe("storyboard review prerequisites", () => {
+  it("does not approve an empty storyboard even at the review stage", async () => {
+    const project = store.createProject({ name: `empty-storyboard-${Date.now()}` });
+    testProjectIds.push(project.id);
+    store.setStage(project.id, "storyboard_user_review");
+    const response = await app.inject({ method: "POST", url: `/api/projects/${project.id}/reviews`, payload: {
+      gate: "storyboard_user", decision: "approved", scores: {}, feedback: ""
+    } });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toContain("没有镜头");
   });
 });
 
