@@ -16,7 +16,7 @@ import { buildPreview } from "./preview.js";
 import { APIMartProvider } from "./providers/apimart.js";
 import { MockProvider } from "./providers/mock.js";
 import { VolcengineAudioProvider } from "./providers/volcengine-audio.js";
-import { assertGateAllowed, assertVisualStyleLocked, scoresPass } from "./workflow.js";
+import { assertArtifactWriteAllowed, assertGateAllowed, assertShotWriteAllowed, assertVisualStyleLocked, scoresPass } from "./workflow.js";
 import { assertNoActiveImageGeneration } from "./image-generation-lock.js";
 import { cutAudioClip } from "./audio-clips.js";
 import { inferAudioStyleProfile, validateAudioPrompt } from "../shared/audio-prompt.js";
@@ -26,6 +26,7 @@ let updateInProgress = false;
 
 const projectSchema = z.object({
   name: z.string().min(1), description: z.string().optional(), template: z.string().optional(),
+  dryRun: z.boolean().optional(),
   aspectRatio: z.string().optional(), targetDuration: z.number().int().min(15).max(1800).optional(),
   contentMode: z.enum(["short_film", "ad", "mv"]).optional(), targetPlatform: z.string().min(1).optional(),
   targetAudience: z.string().optional(), creativePurpose: z.string().optional(), targetEmotion: z.string().optional()
@@ -152,6 +153,7 @@ export async function registerRoutes(app: FastifyInstance) {
   app.post("/api/projects/:projectId/artifacts", async (request, reply) => {
     const { projectId } = request.params as { projectId: string };
     const body = artifactSchema.parse(request.body);
+    assertArtifactWriteAllowed(store.getProject(projectId).stage, body.type);
     const artifact = store.addArtifact(projectId, body);
     const stage = stageForArtifact(body.type);
     if (stage) store.setStage(projectId, stage);
@@ -355,6 +357,7 @@ export async function registerRoutes(app: FastifyInstance) {
 
   app.post("/api/projects/:projectId/shots", async (request, reply) => {
     const { projectId } = request.params as { projectId: string };
+    assertShotWriteAllowed(store.getProject(projectId).stage);
     const body = z.object({ id: z.string().optional(), shotNumber: z.number().int().positive(), title: z.string().min(1), duration: z.number().min(4).max(15).default(5),
       narrativePurpose: z.string().default(""), composition: z.string().default(""), camera: z.string().default(""), action: z.string().default(""), dialogue: z.string().default(""),
       imagePrompt: z.string().default(""), videoPrompt: z.string().default(""), assetIds: z.array(z.string()).default([]),
@@ -411,9 +414,17 @@ export async function registerRoutes(app: FastifyInstance) {
     return { ok: true };
   });
 
+  app.delete("/api/audio-assets/:audioId", async (request) => {
+    const { audioId } = request.params as { audioId: string };
+    const result = store.deleteAudioAsset(audioId);
+    emitEvent("project.updated", { projectId: result.projectId });
+    return { ok: true, ...result };
+  });
+
   app.post("/api/projects/:projectId/audio-assets/generate", async (request, reply) => {
     const { projectId } = request.params as { projectId: string };
-    store.getProject(projectId);
+    const project = store.getProject(projectId);
+    if (project.dryRun) throw new Error("空跑测试项目不会调用真实音频API；请只保存和检查音频提示词。");
     if (!store.getSetting("volcengine_audio_api_key")) throw new Error("尚未配置火山豆包音频 API Key，请先前往 API 设置。");
     const body = z.object({
       audioAssetId: z.string().optional(),
@@ -472,23 +483,79 @@ export async function registerRoutes(app: FastifyInstance) {
       { id: string; name: string; local_path: string; duration: number } | undefined;
     if (!source) throw new Error("场景母带不存在或不属于当前项目。");
     if (!source.local_path || !fs.existsSync(source.local_path)) throw new Error("场景母带还没有本地文件，生成完成后才能切片。");
+    const existingClips = db.prepare("SELECT COUNT(*) AS count FROM audio_clips WHERE project_id=? AND source_audio_asset_id=?").get(projectId, audioAssetId) as { count: number };
+    if (Number(existingClips.count) > 0) throw new Error("该场景母带已经自动切片，请直接试听并调整现有片段，避免重复创建。");
     const body = z.object({ segments: z.array(z.object({ shotId: z.string().nullable().default(null), speaker: z.string().default(""), text: z.string().default(""), startMs: z.number().int().min(0), endMs: z.number().int().positive(), handleMs: z.number().int().min(0).max(1000).default(150) })).min(1).max(200) }).parse(request.body);
-    const created: Array<Record<string, unknown>> = [];
-    for (const segment of body.segments) {
-      if (segment.shotId) {
-        const shot = db.prepare("SELECT id,shot_number,title FROM shots WHERE id=? AND project_id=?").get(segment.shotId, projectId) as { id: string; shot_number: number; title: string } | undefined;
-        if (!shot) throw new Error("切片绑定的镜头不存在或不属于当前项目。");
+    const validated = body.segments.map((segment) => {
+      if (segment.endMs <= segment.startMs) throw new Error("音频切片的结束时间必须大于开始时间。");
+      const shot = segment.shotId
+        ? db.prepare("SELECT id,shot_number,title FROM shots WHERE id=? AND project_id=?").get(segment.shotId, projectId) as { id: string; shot_number: number; title: string } | undefined
+        : undefined;
+      if (segment.shotId && !shot) throw new Error("切片绑定的镜头不存在或不属于当前项目。");
+      return { segment, shot };
+    });
+    const pending: Array<{
+      segment: (typeof body.segments)[number];
+      shot: { id: string; shot_number: number; title: string } | undefined;
+      cut: Awaited<ReturnType<typeof cutAudioClip>>;
+      childId: string;
+      clipId: string;
+      name: string;
+      stamp: string;
+    }> = [];
+    let transactionStarted = false;
+    try {
+      for (const { segment, shot } of validated) {
+        const cut = await cutAudioClip(source.local_path, segment.startMs, segment.endMs, segment.handleMs);
+        pending.push({
+          segment,
+          shot,
+          cut,
+          childId: id("aud"),
+          clipId: id("aclip"),
+          name: `${source.name} · ${shot ? `镜头${shot.shot_number}` : "片段"}${segment.speaker ? ` · ${segment.speaker}` : ""}`,
+          stamp: now()
+        });
       }
-      const cut = await cutAudioClip(source.local_path, segment.startMs, segment.endMs, segment.handleMs);
-      const stamp = now();
-      const childId = id("aud");
-      const clipId = id("aclip");
-      const shot = segment.shotId ? db.prepare("SELECT shot_number,title FROM shots WHERE id=?").get(segment.shotId) as { shot_number: number; title: string } | undefined : undefined;
-      const name = `${source.name} · ${shot ? `镜头${shot.shot_number}` : "片段"}${segment.speaker ? ` · ${segment.speaker}` : ""}`;
-      db.prepare("INSERT INTO audio_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(childId, projectId, "dialogue_line", name, null, cut.localPath, "", cut.duration, "继承场景母带权利说明，请确认", `场景母带「${source.name}」${segment.startMs}ms-${segment.endMs}ms；镜头级口型参考。`, stamp, stamp);
-      db.prepare("INSERT INTO audio_clips VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)").run(clipId, projectId, audioAssetId, childId, segment.shotId, segment.speaker, segment.text, segment.startMs, segment.endMs, segment.handleMs, "draft", "待人工试听确认后绑定镜头", stamp, stamp);
-      created.push({ id: clipId, audioAssetId: childId, localPath: cut.localPath, duration: cut.duration, shotId: segment.shotId, startMs: segment.startMs, endMs: segment.endMs });
+      db.exec("BEGIN");
+      transactionStarted = true;
+      for (const item of pending) {
+        db.prepare(`INSERT INTO audio_assets
+          (id,project_id,type,name,character_asset_id,local_path,remote_url,duration,rights_note,description,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          item.childId, projectId, "dialogue_line", item.name, null, item.cut.localPath, "", item.cut.duration,
+          "继承场景母带权利说明，请确认",
+          `场景母带「${source.name}」${item.segment.startMs}ms-${item.segment.endMs}ms；镜头级口型参考。`,
+          item.stamp, item.stamp
+        );
+        db.prepare(`INSERT INTO audio_clips
+          (id,project_id,source_audio_asset_id,audio_asset_id,shot_id,speaker,text,start_ms,end_ms,handle_ms,status,notes,created_at,updated_at)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+          item.clipId, projectId, audioAssetId, item.childId, item.segment.shotId, item.segment.speaker, item.segment.text,
+          item.segment.startMs, item.segment.endMs, item.segment.handleMs, "draft", "待人工试听确认后绑定镜头",
+          item.stamp, item.stamp
+        );
+      }
+      db.exec("COMMIT");
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) {
+        try { db.exec("ROLLBACK"); } catch { /* retain the original failure */ }
+      }
+      for (const item of pending) {
+        try { fs.rmSync(item.cut.localPath, { force: true }); } catch { /* best-effort rollback of generated clips */ }
+      }
+      throw error;
     }
+    const created = pending.map((item) => ({
+      id: item.clipId,
+      audioAssetId: item.childId,
+      localPath: item.cut.localPath,
+      duration: item.cut.duration,
+      shotId: item.segment.shotId,
+      startMs: item.segment.startMs,
+      endMs: item.segment.endMs
+    }));
     emitEvent("project.updated", { projectId });
     return reply.code(201).send({ clips: created });
   });
@@ -657,10 +724,11 @@ export async function registerRoutes(app: FastifyInstance) {
     const body = z.object({ shotId: z.string().nullable().optional(), assetId: z.string().nullable().optional(), kind: z.enum(["image", "video"]),
       provider: z.enum(["apimart", "mock"]), model: z.string().min(1), prompt: z.string().min(1), params: z.record(z.string(), z.unknown()).default({}), batch: z.boolean().default(false) }).parse(request.body);
     const project = store.getProject(projectId);
-    if (body.provider !== "mock") assertVisualStyleLocked(project);
+    if (body.provider !== "mock" || project.dryRun) assertVisualStyleLocked(project);
     const allowedStages: WorkflowStage[] = body.kind === "image" ? ["asset_design", "asset_user_review", "storyboard_design", "storyboard_user_review", "sample_image", "batch_generation"] : ["sample_video", "batch_generation"];
     if (!allowedStages.includes(project.stage)) throw new Error(`当前阶段“${project.stage}”不允许提交${body.kind === "image" ? "图片" : "视频"}任务。`);
-    if (body.kind === "image" && (body.assetId || body.shotId) && body.provider !== "apimart") throw new Error("资产中心和分镜台只允许提交APIMart真实生图任务，不支持Mock模拟生成。");
+    if (body.provider === "mock" && !project.dryRun && (body.assetId || body.shotId)) throw new Error("只有明确标记为空跑测试的项目才能绑定Mock结果；正式项目请使用Codex或APIMart真实生成。");
+    if (project.dryRun && body.provider !== "mock") throw new Error("空跑测试项目只允许使用Mock，不得提交Codex或APIMart真实生成。");
     if (body.kind === "image" && body.assetId && body.shotId) throw new Error("图片任务不能同时绑定资产和分镜。");
     let imageAsset: { id: string; type: string } | undefined;
     if (body.kind === "image" && body.assetId) {
@@ -673,7 +741,7 @@ export async function registerRoutes(app: FastifyInstance) {
     }
     if (body.kind === "image" && (body.assetId || body.shotId)) {
       assertNoActiveImageGeneration({ projectId, shotId: body.shotId, assetId: body.assetId });
-      if (!store.getSetting("apimart_api_key")) throw new Error("尚未配置APIMart API Key，请先前往API设置。");
+      if (body.provider === "apimart" && !store.getSetting("apimart_api_key")) throw new Error("尚未配置APIMart API Key，请先前往API设置。");
       if (!imageModelOptions.some((option) => option.id === body.model)) throw new Error("所选生图模型不受支持。");
       const allowedSizes = ["1:1", "3:2", "2:3", "4:3", "3:4", "16:9", "9:16"];
       if (!allowedSizes.includes(String(body.params.size))) throw new Error("请选择工作台支持的图片画幅比例。");
@@ -808,7 +876,9 @@ export async function registerRoutes(app: FastifyInstance) {
     };
     if (!isWithin(safeRoot) && !isWithin(dataRoot)) return reply.code(403).send({ error: "禁止访问工作台数据目录之外的文件。" });
     if (!fs.existsSync(resolved)) return reply.code(404).send({ error: "文件不存在。" });
-    return reply.type(path.extname(resolved) === ".mp4" ? "video/mp4" : path.extname(resolved) === ".svg" ? "image/svg+xml" : "application/octet-stream").send(fs.createReadStream(resolved));
+    const ext = path.extname(resolved).toLowerCase();
+    const mime = ext === ".mp4" ? "video/mp4" : ext === ".png" ? "image/png" : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : ext === ".svg" ? "image/svg+xml" : "application/octet-stream";
+    return reply.type(mime).send(fs.createReadStream(resolved));
   });
 
   app.get("/api/settings", async () => ({

@@ -28,8 +28,8 @@ describe("锁定剧本对白提取", () => {
   });
 
   it("分镜产生后按场景和对白内容绑定具体镜头", () => {
-    const lines = extractLockedScriptDialogue([script], [shot({})]);
-    expect(lines[0]).toMatchObject({ shotId: "shot_1", shotNumber: 1, shotTitle: "递鞋" });
+    const lines = extractLockedScriptDialogue([script], [shot({ audioDirection: "17岁男高中生，标准普通话，音量偏低。" })]);
+    expect(lines[0]).toMatchObject({ shotId: "shot_1", shotNumber: 1, shotTitle: "递鞋", voiceDirection: "17岁男高中生，标准普通话，音量偏低。" });
     expect(lines[1].shotId).toBeNull();
   });
 

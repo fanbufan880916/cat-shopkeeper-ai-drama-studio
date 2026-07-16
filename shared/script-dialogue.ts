@@ -11,9 +11,11 @@ export interface ScriptDialogueLine {
   speaker: string;
   text: string;
   description: string;
+  voiceDirection: string;
+  sceneSound: string;
 }
 
-type ScriptScene = { id?: string; beat?: number; name?: string; dialogue?: unknown };
+type ScriptScene = { id?: string; beat?: number; name?: string; dialogue?: unknown; sound?: unknown };
 type StructuredScript = { scenes?: ScriptScene[] };
 
 function parseLine(raw: string) {
@@ -57,6 +59,8 @@ export function extractLockedScriptDialogue(artifacts: ArtifactVersion[], shots:
         shotTitle: shot?.title ?? "",
         speaker: parsed.speaker,
         text: parsed.text,
+        voiceDirection: shot?.audioDirection ?? "",
+        sceneSound: typeof scene.sound === "string" ? scene.sound.trim() : "",
         description: shot
           ? `镜头${shot.shotNumber}成品台词；用于稳定音色与口型时序。`
           : `${sceneName}对白母带；分镜产生后将按对白内容和场景关系绑定镜头。`

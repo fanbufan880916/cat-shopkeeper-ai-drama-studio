@@ -14,6 +14,7 @@ db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=50
 db.exec(`
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', template TEXT NOT NULL,
+  dry_run INTEGER NOT NULL DEFAULT 0,
   aspect_ratio TEXT NOT NULL, target_duration INTEGER NOT NULL,
   content_mode TEXT NOT NULL DEFAULT 'short_film', target_platform TEXT NOT NULL DEFAULT 'douyin',
   target_audience TEXT NOT NULL DEFAULT '', creative_purpose TEXT NOT NULL DEFAULT '', target_emotion TEXT NOT NULL DEFAULT '',
@@ -107,6 +108,7 @@ CREATE TABLE IF NOT EXISTS skill_status (
 const projectColumns = db.prepare("PRAGMA table_info(projects)").all() as { name: string }[];
 const addProjectColumn = (name: string, definition: string) => { if (!projectColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE projects ADD COLUMN ${name} ${definition}`); };
 addProjectColumn("content_mode", "TEXT NOT NULL DEFAULT 'short_film'");
+addProjectColumn("dry_run", "INTEGER NOT NULL DEFAULT 0");
 addProjectColumn("target_platform", "TEXT NOT NULL DEFAULT 'douyin'");
 addProjectColumn("target_audience", "TEXT NOT NULL DEFAULT ''");
 addProjectColumn("creative_purpose", "TEXT NOT NULL DEFAULT ''");
@@ -200,6 +202,7 @@ function projectFrom(row: Record<string, unknown>): Project {
   };
   return {
     id: String(row.id), name: String(row.name), description: String(row.description), template: String(row.template),
+    dryRun: Boolean(row.dry_run),
     aspectRatio: String(row.aspect_ratio), targetDuration: Number(row.target_duration), contentMode: (row.content_mode ?? "short_film") as ContentMode,
     targetPlatform: String(row.target_platform ?? "douyin"), targetAudience: String(row.target_audience ?? ""),
     creativePurpose: String(row.creative_purpose ?? ""), targetEmotion: String(row.target_emotion ?? ""), visualStyle, stage: row.stage as WorkflowStage,
@@ -276,14 +279,14 @@ export const store = {
     if (!row) throw new Error("项目不存在。");
     return projectFrom(row);
   },
-  createProject(input: { name: string; description?: string; template?: string; aspectRatio?: string; targetDuration?: number; contentMode?: ContentMode; targetPlatform?: string; targetAudience?: string; creativePurpose?: string; targetEmotion?: string; visualStyle?: VisualStyleProfile }) {
+  createProject(input: { name: string; description?: string; template?: string; dryRun?: boolean; aspectRatio?: string; targetDuration?: number; contentMode?: ContentMode; targetPlatform?: string; targetAudience?: string; creativePurpose?: string; targetEmotion?: string; visualStyle?: VisualStyleProfile }) {
     const defaultVisualStyle = input.visualStyle ?? (process.env.NODE_ENV === "test" ? { status: "locked" as const, name: "测试用现代现实主义", descriptors: ["测试"], evidence: "仅用于自动化测试。", source: "user" as const, sourceArtifactId: null } : inferVisualStyleProfile(""));
-    const project: Project = { id: id("prj"), name: input.name, description: input.description ?? "", template: input.template ?? "90秒竖屏",
+    const project: Project = { id: id("prj"), name: input.name, description: input.description ?? "", template: input.template ?? "90秒竖屏", dryRun: input.dryRun ?? false,
       aspectRatio: input.aspectRatio ?? "9:16", targetDuration: input.targetDuration ?? 90, contentMode: input.contentMode ?? "short_film", targetPlatform: input.targetPlatform ?? "douyin",
       targetAudience: input.targetAudience ?? "", creativePurpose: input.creativePurpose ?? "", targetEmotion: input.targetEmotion ?? "",
       visualStyle: defaultVisualStyle, stage: "idea", internalRevisionCount: 0, createdAt: now(), updatedAt: now() };
-    db.prepare("INSERT INTO projects (id,name,description,template,aspect_ratio,target_duration,content_mode,target_platform,target_audience,creative_purpose,target_emotion,visual_style_status,visual_style_json,stage,internal_revision_count,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
-      project.id, project.name, project.description, project.template, project.aspectRatio, project.targetDuration, project.contentMode, project.targetPlatform,
+    db.prepare("INSERT INTO projects (id,name,description,template,dry_run,aspect_ratio,target_duration,content_mode,target_platform,target_audience,creative_purpose,target_emotion,visual_style_status,visual_style_json,stage,internal_revision_count,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      project.id, project.name, project.description, project.template, project.dryRun ? 1 : 0, project.aspectRatio, project.targetDuration, project.contentMode, project.targetPlatform,
       project.targetAudience, project.creativePurpose, project.targetEmotion, project.visualStyle.status, asJson(project.visualStyle), project.stage, project.internalRevisionCount, project.createdAt, project.updatedAt);
     return project;
   },
@@ -320,6 +323,46 @@ export const store = {
       if (file.startsWith(previewPrefix)) { try { fs.rmSync(file, { force: true }); } catch { /* best effort */ } }
     }
     return { projectId, deletedFiles: files.length };
+  },
+  deleteAudioAsset(audioId: string) {
+    const source = db.prepare("SELECT id,project_id,local_path FROM audio_assets WHERE id=?").get(audioId) as { id: string; project_id: string; local_path: string } | undefined;
+    if (!source) throw new Error("声音资产不存在。");
+    const activeAudioJobs = db.prepare("SELECT id,params_json FROM generation_jobs WHERE project_id=? AND kind='audio' AND status IN ('draft','submitted','processing')").all(source.project_id) as Array<{ id: string; params_json: string }>;
+    if (activeAudioJobs.some((job) => String(parseJson<Record<string, unknown>>(job.params_json, {}).audioAssetId ?? "") === audioId)) {
+      throw new Error("该声音资产仍在生成中，任务完成或失败后才能移除。");
+    }
+    const clipRows = db.prepare("SELECT id,source_audio_asset_id,audio_asset_id FROM audio_clips WHERE project_id=? AND (source_audio_asset_id=? OR audio_asset_id=?)").all(source.project_id, audioId, audioId) as Array<{ id: string; source_audio_asset_id: string; audio_asset_id: string }>;
+    const dependentIds = clipRows.filter((clip) => clip.source_audio_asset_id === audioId).map((clip) => clip.audio_asset_id);
+    const audioIds = [...new Set([audioId, ...dependentIds])];
+    const placeholders = audioIds.map(() => "?").join(",");
+    const audioRows = db.prepare(`SELECT id,local_path FROM audio_assets WHERE project_id=? AND id IN (${placeholders})`).all(source.project_id, ...audioIds) as Array<{ id: string; local_path: string }>;
+    const safeRoot = `${path.resolve(dataDir)}${path.sep}`;
+    const files = audioRows.map((row) => row.local_path.trim()).filter(Boolean).map((file) => path.resolve(file)).filter((file, index, all) => file.startsWith(safeRoot) && all.indexOf(file) === index);
+    const shots = db.prepare("SELECT id,audio_asset_ids_json FROM shots WHERE project_id=?").all(source.project_id) as Array<{ id: string; audio_asset_ids_json: string }>;
+    const affectedShots = shots.flatMap((shot) => {
+      const currentIds = parseJson<string[]>(shot.audio_asset_ids_json, []);
+      const nextIds = currentIds.filter((id) => !audioIds.includes(id));
+      return nextIds.length === currentIds.length ? [] : [{ id: shot.id, nextIds }];
+    });
+    db.exec("BEGIN");
+    try {
+      db.prepare(`DELETE FROM audio_clips WHERE project_id=? AND (source_audio_asset_id IN (${placeholders}) OR audio_asset_id IN (${placeholders}))`).run(source.project_id, ...audioIds, ...audioIds);
+      for (const shot of affectedShots) {
+        db.prepare(`UPDATE shots SET audio_asset_ids_json=?,status='stale',sample_approved=0,approved_video_job_id=NULL,observed_end_state='',observed_audio_state='',last_frame_media_id=NULL,updated_at=? WHERE id=?`).run(asJson(shot.nextIds), now(), shot.id);
+      }
+      for (const row of audioRows) {
+        if (row.local_path) db.prepare("DELETE FROM media_files WHERE project_id=? AND local_path=?").run(source.project_id, row.local_path);
+      }
+      db.prepare(`DELETE FROM audio_assets WHERE project_id=? AND id IN (${placeholders})`).run(source.project_id, ...audioIds);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    for (const file of files) {
+      try { if (fs.existsSync(file)) fs.rmSync(file, { force: true }); } catch { /* cleanup must not undo database deletion */ }
+    }
+    return { projectId: source.project_id, audioId, deletedAudioAssets: audioRows.length, deletedClips: clipRows.length, affectedShots: affectedShots.length, deletedFiles: files.length };
   },
   setStage(projectId: string, stage: WorkflowStage) {
     db.prepare("UPDATE projects SET stage=?, updated_at=? WHERE id=?").run(stage, now(), projectId);

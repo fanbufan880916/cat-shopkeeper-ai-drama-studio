@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { db, store } from "./db.js";
 import { emitEvent } from "./events.js";
-import { assertGateAllowed, assertVisualStyleLocked, scoresPass } from "./workflow.js";
+import { assertArtifactWriteAllowed, assertGateAllowed, assertShotWriteAllowed, assertVisualStyleLocked, scoresPass } from "./workflow.js";
 import { mediaDir } from "./paths.js";
 import { refreshSkillStatus } from "./skills.js";
 import { asJson, id, now } from "./utils.js";
@@ -20,9 +20,9 @@ server.registerTool("list_projects", {
 
 server.registerTool("create_project", {
   description: "创建一个新的漫剧项目，默认90秒9:16竖屏。",
-  inputSchema: { name: z.string().min(1), description: z.string().default(""), targetDuration: z.number().int().min(15).max(1800).default(90), aspectRatio: z.string().default("9:16"), contentMode: z.enum(["short_film", "ad", "mv"]).default("short_film"), targetPlatform: z.string().default("douyin"), targetAudience: z.string().optional(), creativePurpose: z.string().optional(), targetEmotion: z.string().optional() }
+  inputSchema: { name: z.string().min(1), description: z.string().default(""), dryRun: z.boolean().default(false), targetDuration: z.number().int().min(15).max(1800).default(90), aspectRatio: z.string().default("9:16"), contentMode: z.enum(["short_film", "ad", "mv"]).default("short_film"), targetPlatform: z.string().default("douyin"), targetAudience: z.string().optional(), creativePurpose: z.string().optional(), targetEmotion: z.string().optional() }
 }, async (input) => {
-  const project = store.createProject({ name: input.name, description: input.description, targetDuration: input.targetDuration, aspectRatio: input.aspectRatio, contentMode: input.contentMode, targetPlatform: input.targetPlatform, targetAudience: input.targetAudience, creativePurpose: input.creativePurpose, targetEmotion: input.targetEmotion });
+  const project = store.createProject({ name: input.name, description: input.description, dryRun: input.dryRun, targetDuration: input.targetDuration, aspectRatio: input.aspectRatio, contentMode: input.contentMode, targetPlatform: input.targetPlatform, targetAudience: input.targetAudience, creativePurpose: input.creativePurpose, targetEmotion: input.targetEmotion });
   emitEvent("project.updated", { projectId: project.id });
   return result(project);
 });
@@ -63,6 +63,7 @@ server.registerTool("save_artifact_version", {
     title: z.string(), content: z.unknown(), createdBy: z.string().default("main-director")
   }
 }, async ({ projectId, type, title, content, createdBy }) => {
+  assertArtifactWriteAllowed(store.getProject(projectId).stage, type);
   const artifact = store.addArtifact(projectId, { type, title, content, createdBy });
   if (type === "script") store.setStage(projectId, "script_internal_review");
   if (type === "asset_plan") store.setStage(projectId, "asset_user_review");
@@ -118,6 +119,7 @@ server.registerTool("upsert_shot", {
     audioAssetIds: z.array(z.string()).max(3).default([]), speakerMap: z.string().default(""), audioDirection: z.string().default(""),
     lipSyncNotes: z.string().default(""), observedEndState: z.string().default("") }
 }, async ({ projectId, ...input }) => {
+  assertShotWriteAllowed(store.getProject(projectId).stage);
   const shot = store.upsertShot(projectId, input);
   emitEvent("project.updated", { projectId });
   return result(shot);

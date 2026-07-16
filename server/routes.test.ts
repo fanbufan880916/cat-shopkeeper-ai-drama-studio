@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { registerRoutes } from "./routes.js";
 import { db, store } from "./db.js";
 import { encryptSecret } from "./crypto.js";
-import { dbPath, rootDir } from "./paths.js";
+import { dbPath, mediaDir, rootDir } from "./paths.js";
 
 vi.mock("./preview.js", () => ({ buildPreview: vi.fn((projectId: string) => `C:\\preview\\${projectId}-${Date.now()}.mp4`) }));
 vi.mock("./workbench-update.js", () => ({
@@ -23,6 +23,25 @@ vi.mock("./workbench-update.js", () => ({
     buildCompleted: true, restartRequired: true
   }))
 }));
+vi.mock("./audio-clips.js", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const { mediaDir } = await import("./paths.js");
+  let clipIndex = 0;
+  return {
+    cutAudioClip: vi.fn(async (_sourcePath: string, startMs: number, endMs: number, handleMs = 150) => {
+      fs.mkdirSync(mediaDir, { recursive: true });
+      const localPath = path.join(mediaDir, `test-audio-clip-${process.pid}-${clipIndex++}.wav`);
+      fs.writeFileSync(localPath, "mock wav");
+      return {
+        localPath,
+        duration: Number(((endMs - startMs + handleMs * 2) / 1000).toFixed(3)),
+        startMs: Math.max(0, startMs - handleMs),
+        endMs: endMs + handleMs
+      };
+    })
+  };
+});
 
 const app = Fastify({ logger: false });
 const testProjectIds: string[] = [];
@@ -87,16 +106,44 @@ describe("project creative profile fields", () => {
     expect(updated.json()).toMatchObject({ targetAudience: "六盘水本地用户", creativePurpose: "引导到店", targetEmotion: "安心" });
   });
 
+  it("persists the isolated dry-run flag without changing legacy projects", async () => {
+    const response = await app.inject({ method: "POST", url: "/api/projects", payload: {
+      name: `dry-run-project-${Date.now()}`, dryRun: true
+    } });
+    expect(response.statusCode).toBe(201);
+    const project = response.json();
+    testProjectIds.push(project.id);
+    expect(project.dryRun).toBe(true);
+    expect(store.getProject(project.id).dryRun).toBe(true);
+  });
+
   it("continues accepting the old request body", async () => {
     const response = await app.inject({ method: "POST", url: "/api/projects", payload: { name: `legacy-project-${Date.now()}` } });
     expect(response.statusCode).toBe(201);
     const project = response.json();
     testProjectIds.push(project.id);
-    expect(project).toMatchObject({ targetAudience: "", creativePurpose: "", targetEmotion: "" });
+    expect(project).toMatchObject({ targetAudience: "", creativePurpose: "", targetEmotion: "", dryRun: false });
   });
 });
 
 describe("user script review", () => {
+  it("blocks direct storyboard writes and shot writes before their stage", async () => {
+    const project = store.createProject({ name: `future-write-guard-${Date.now()}` });
+    testProjectIds.push(project.id);
+    const storyboard = await app.inject({ method: "POST", url: `/api/projects/${project.id}/artifacts`, payload: {
+      type: "storyboard", title: "越级分镜", content: { shots: [] }
+    } });
+    const shot = await app.inject({ method: "POST", url: `/api/projects/${project.id}/shots`, payload: {
+      shotNumber: 1, title: "越级镜头", duration: 5
+    } });
+    expect(storyboard.statusCode).toBe(400);
+    expect(storyboard.json().error).toContain("不能写入");
+    expect(shot.statusCode).toBe(400);
+    expect(shot.json().error).toContain("不能新增或修改分镜");
+    expect(store.dashboard(project.id).shots).toHaveLength(0);
+    expect(store.getProject(project.id).stage).toBe("idea");
+  });
+
   it("requires feedback when rejecting a script", async () => {
     const project = store.createProject({ name: `review-reject-${Date.now()}` });
     testProjectIds.push(project.id);
@@ -226,7 +273,7 @@ describe("APIMart settings", () => {
     expect(response.json().hasApiKey).toBe(false);
   });
 
-  it("rejects Mock generation from the asset center", async () => {
+  it("rejects bound Mock generation from a normal project", async () => {
     const project = store.createProject({ name: `asset-real-generation-${Date.now()}` });
     testProjectIds.push(project.id);
     store.setStage(project.id, "asset_design");
@@ -236,7 +283,39 @@ describe("APIMart settings", () => {
       params: { size: "3:2", resolution: "1k", quality: "high", n: 1 }
     } });
     expect(response.statusCode).toBe(400);
-    expect(response.json().error).toContain("不支持Mock模拟生成");
+    expect(response.json().error).toContain("只有明确标记为空跑测试");
+  });
+
+  it("allows bound Mock generation only inside an isolated dry-run project", async () => {
+    const project = store.createProject({ name: `asset-dry-run-${Date.now()}`, dryRun: true });
+    testProjectIds.push(project.id);
+    store.setStage(project.id, "asset_design");
+    const asset = store.upsertAsset(project.id, { type: "character", name: "Test character", prompt: validCharacterPrompt });
+    const response = await app.inject({ method: "POST", url: `/api/projects/${project.id}/jobs`, payload: {
+      assetId: asset.id, kind: "image", provider: "mock", model: "gpt-image-2-official", prompt: validCharacterPrompt,
+      params: { size: "3:2", resolution: "1k", quality: "high", n: 1 }
+    } });
+    expect(response.statusCode).toBe(201);
+    expect(response.json()).toMatchObject({ provider: "mock", assetId: asset.id, cost: 0 });
+  });
+
+  it("blocks real providers and real audio inside a dry-run project", async () => {
+    const project = store.createProject({ name: `dry-run-provider-lock-${Date.now()}`, dryRun: true });
+    testProjectIds.push(project.id);
+    store.setStage(project.id, "asset_design");
+    const asset = store.upsertAsset(project.id, { type: "style", name: "Test style", prompt: "现代写实风格样板图，柔和自然光，材质清晰。" });
+    const image = await app.inject({ method: "POST", url: `/api/projects/${project.id}/jobs`, payload: {
+      assetId: asset.id, kind: "image", provider: "apimart", model: "gpt-image-2-official", prompt: asset.prompt,
+      params: { size: "3:2", resolution: "1k", quality: "high", n: 1 }
+    } });
+    expect(image.statusCode).toBe(400);
+    expect(image.json().error).toContain("空跑测试项目只允许使用Mock");
+
+    const audio = await app.inject({ method: "POST", url: `/api/projects/${project.id}/audio-assets/generate`, payload: {
+      name: "测试对白", textPrompt: "年轻女声，平静地说：我准备好了。"
+    } });
+    expect(audio.statusCode).toBe(400);
+    expect(audio.json().error).toContain("不会调用真实音频API");
   });
 
   it("normalizes Nano Banana asset generation parameters and strips management text", async () => {
@@ -785,6 +864,64 @@ describe("Volcengine audio generation", () => {
     } });
     expect(response.statusCode).toBe(400);
     expect(response.json().error).toContain("音频提示词未通过检查");
+  });
+
+  it("removes an obsolete master, its local file and shot references", async () => {
+    const project = store.createProject({ name: `delete-audio-master-${Date.now()}` });
+    testProjectIds.push(project.id);
+    fs.mkdirSync(mediaDir, { recursive: true });
+    const audioId = `aud_delete_${Date.now()}`;
+    const localPath = path.join(mediaDir, `${audioId}.wav`);
+    fs.writeFileSync(localPath, "obsolete audio");
+    const stamp = new Date().toISOString();
+    db.prepare("INSERT INTO audio_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(audioId, project.id, "scene_master", "错误母带", null, localPath, "", 3, "本人授权", "", stamp, stamp);
+    const shot = store.upsertShot(project.id, { shotNumber: 1, title: "引用错误母带", audioMode: "dialogue_lipsync", audioAssetIds: [audioId] });
+    const response = await app.inject({ method: "DELETE", url: `/api/audio-assets/${audioId}` });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ ok: true, audioId, deletedAudioAssets: 1, affectedShots: 1, deletedFiles: 1 });
+    expect(db.prepare("SELECT id FROM audio_assets WHERE id=?").get(audioId)).toBeUndefined();
+    expect(fs.existsSync(localPath)).toBe(false);
+    expect(store.dashboard(project.id).shots.find((item) => item.id === shot.id)).toMatchObject({ audioAssetIds: [], status: "stale" });
+  });
+
+  it("automatically splits a scene master into a complete 14-column clip record", async () => {
+    const project = store.createProject({ name: `split-audio-master-${Date.now()}` });
+    testProjectIds.push(project.id);
+    fs.mkdirSync(mediaDir, { recursive: true });
+    const masterId = `aud_master_${Date.now()}`;
+    const masterPath = path.join(mediaDir, `${masterId}.wav`);
+    fs.writeFileSync(masterPath, "mock master");
+    const stamp = new Date().toISOString();
+    db.prepare("INSERT INTO audio_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(masterId, project.id, "scene_master", "测试母带", null, masterPath, "", 10, "本人授权", "", stamp, stamp);
+    const shot = store.upsertShot(project.id, { shotNumber: 1, title: "测试对白", dialogue: "小曼：你好。" });
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/projects/${project.id}/audio-assets/${masterId}/split`,
+      payload: { segments: [{ shotId: shot.id, speaker: "小曼", text: "你好。", startMs: 0, endMs: 1200, handleMs: 150 }] }
+    });
+    expect(response.statusCode).toBe(201);
+    expect(response.json().clips).toHaveLength(1);
+    const dashboard = store.dashboard(project.id);
+    expect(dashboard.audioClips).toHaveLength(1);
+    expect(dashboard.audioClips[0]).toMatchObject({
+      sourceAudioAssetId: masterId,
+      shotId: shot.id,
+      speaker: "小曼",
+      text: "你好。",
+      status: "draft",
+      createdAt: expect.any(String),
+      updatedAt: expect.any(String)
+    });
+    const duplicate = await app.inject({
+      method: "POST",
+      url: `/api/projects/${project.id}/audio-assets/${masterId}/split`,
+      payload: { segments: [{ shotId: shot.id, speaker: "小曼", text: "你好。", startMs: 0, endMs: 1200, handleMs: 150 }] }
+    });
+    expect(duplicate.statusCode).toBe(400);
+    expect(duplicate.json().error).toContain("已经自动切片");
+    expect(store.dashboard(project.id).audioClips).toHaveLength(1);
+    const cleanup = await app.inject({ method: "DELETE", url: `/api/audio-assets/${masterId}` });
+    expect(cleanup.statusCode).toBe(200);
   });
 });
 

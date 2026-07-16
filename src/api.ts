@@ -61,6 +61,7 @@ export const api = {
   updateAudioClip: (clipId: string, body: unknown) => request(`/api/audio-clips/${clipId}`, { method: "PUT", body: JSON.stringify(body) }),
   approveAudioClip: (clipId: string, shotId?: string | null) => request(`/api/audio-clips/${clipId}/approve`, { method: "POST", body: JSON.stringify({ shotId }) }),
   updateAudioAsset: (audioId: string, body: { remoteUrl: string; rightsNote: string; description: string }) => request(`/api/audio-assets/${audioId}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteAudioAsset: (audioId: string) => request<{ ok: true; audioId: string; deletedFiles: number }>(`/api/audio-assets/${audioId}`, { method: "DELETE" }),
   createCodexShotImageRequest: (shotId: string, body: { prompt: string; aspectRatio: string; quality: "standard" | "high"; count: number }) => request(`/api/shots/${shotId}/codex-image-requests`, { method: "POST", body: JSON.stringify(body) }),
   cancelCodexImageRequest: (requestId: string) => request(`/api/codex-image-requests/${requestId}/cancel`, { method: "POST" }),
   lockShotImage: (shotId: string, jobId: string, mediaId: string) => request(`/api/shots/${shotId}/lock-image`, { method: "POST", body: JSON.stringify({ jobId, mediaId }) }),

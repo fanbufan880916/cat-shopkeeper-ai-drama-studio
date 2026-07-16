@@ -1,4 +1,4 @@
-import type { Project, ReviewGate, WorkflowStage } from "../shared/types.js";
+import type { ArtifactType, Project, ReviewGate, WorkflowStage } from "../shared/types.js";
 import { styleGateMessage } from "../shared/creative-profile.js";
 
 export const nextStageForGate: Partial<Record<ReviewGate, WorkflowStage>> = {
@@ -34,4 +34,25 @@ export function assertVisualStyleLocked(project: Project) {
   if (project.visualStyle.status !== "locked" || !project.visualStyle.name.trim()) {
     throw new Error(styleGateMessage(project));
   }
+}
+
+export function assertArtifactWriteAllowed(stage: WorkflowStage, type: ArtifactType) {
+  const allowed: Record<ArtifactType, WorkflowStage[]> = {
+    idea: ["idea"],
+    script: ["idea", "script_internal_review"],
+    director_review: ["script_internal_review"],
+    audience_review: ["script_internal_review"],
+    asset_plan: ["asset_design", "asset_user_review"],
+    storyboard: ["storyboard_design", "storyboard_user_review"],
+    final_export: []
+  };
+  if (!allowed[type].includes(stage)) {
+    if (type === "final_export") throw new Error("成片预览只能由预览接口根据全部已通过镜头生成，不能直接写入导出产物。");
+    throw new Error(`当前阶段“${stage}”不能写入“${type}”产物。`);
+  }
+}
+
+export function assertShotWriteAllowed(stage: WorkflowStage) {
+  const allowed: WorkflowStage[] = ["storyboard_design", "storyboard_user_review", "sample_image", "sample_video", "batch_generation"];
+  if (!allowed.includes(stage)) throw new Error(`当前阶段“${stage}”不能新增或修改分镜。`);
 }

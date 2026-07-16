@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertGateAllowed, assertVisualStyleLocked, scoresPass } from "./workflow.js";
+import { assertArtifactWriteAllowed, assertGateAllowed, assertShotWriteAllowed, assertVisualStyleLocked, scoresPass } from "./workflow.js";
 
 describe("workflow guards", () => {
   it("requires strong internal review scores", () => {
@@ -14,9 +14,18 @@ describe("workflow guards", () => {
     expect(() => assertGateAllowed("asset_user_review", "asset_user")).not.toThrow();
   });
 
+  it("blocks artifacts and shots from skipping future stages", () => {
+    expect(() => assertArtifactWriteAllowed("idea", "script")).not.toThrow();
+    expect(() => assertArtifactWriteAllowed("idea", "storyboard")).toThrow(/不能写入/);
+    expect(() => assertArtifactWriteAllowed("batch_generation", "final_export")).toThrow(/预览接口/);
+    expect(() => assertShotWriteAllowed("storyboard_design")).not.toThrow();
+    expect(() => assertShotWriteAllowed("idea")).toThrow(/不能新增或修改分镜/);
+    expect(() => assertShotWriteAllowed("completed")).toThrow(/不能新增或修改分镜/);
+  });
+
   it("blocks real generation until the visual style is locked", () => {
     const project = {
-      id: "p", name: "test", description: "", template: "", aspectRatio: "9:16", targetDuration: 30,
+      id: "p", name: "test", description: "", template: "", dryRun: false, aspectRatio: "9:16", targetDuration: 30,
       contentMode: "short_film" as const, targetPlatform: "douyin", targetAudience: "", creativePurpose: "", targetEmotion: "",
       visualStyle: { status: "needs_review" as const, name: "", descriptors: [], evidence: "", source: "none" as const, sourceArtifactId: null },
       stage: "sample_image" as const, internalRevisionCount: 0, createdAt: "", updatedAt: ""

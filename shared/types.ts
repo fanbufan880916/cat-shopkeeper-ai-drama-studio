@@ -42,6 +42,7 @@ export interface Project {
   name: string;
   description: string;
   template: string;
+  dryRun: boolean;
   aspectRatio: string;
   targetDuration: number;
   contentMode: ContentMode;
