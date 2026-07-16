@@ -1,4 +1,4 @@
-import type { Asset } from "../shared/types";
+import type { Asset, GenerationJob } from "../shared/types";
 
 export function assetImageSize(asset: Pick<Asset, "type" | "negativePrompt">) {
   const match = asset.negativePrompt.match(/APIMart参数：(\{[^\n]+\})/);
@@ -13,4 +13,8 @@ export function assetImageSize(asset: Pick<Asset, "type" | "negativePrompt">) {
   if (asset.type === "scene") return "16:9";
   if (asset.type === "character" || asset.type === "style") return "3:2";
   return "1:1";
+}
+
+export function isActiveAssetResultJob(job: Pick<GenerationJob, "status">) {
+  return job.status === "draft" || job.status === "submitted" || job.status === "processing";
 }

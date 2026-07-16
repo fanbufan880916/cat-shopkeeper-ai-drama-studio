@@ -5,7 +5,7 @@ import clsx from "clsx";
 import { api } from "./api";
 import { globalSettingsRoute, projectRoute } from "./navigation";
 import { canAccessSection, getNavigationState, getSectionUnlockReason, getStageAction, sectionPath, type WorkspaceSection } from "./workflow-ui";
-import { assetImageSize } from "./asset-generation";
+import { assetImageSize, isActiveAssetResultJob } from "./asset-generation";
 import { assetUiStatusLabels, filterAndSortAssets, getAssetUiStatus, type AssetUiStatus } from "./asset-ui";
 import { codexTaskObject, sortTasks, taskObject } from "./task-ui";
 import { cleanImagePrompt } from "../shared/image-prompt";
@@ -596,7 +596,9 @@ function AssetsPage({ data, reload }: { data: DashboardData; reload: () => Promi
     });
   }, [data]);
   const selectedImageCandidates = selected ? projectImageLibrary.filter((item) => item.job.assetId === selected.id) : [];
-  const selectedJobsWithoutImages = selectedJobs.filter((job) => !selectedImageCandidates.some((item) => item.job.id === job.id));
+  const selectedActiveJobsWithoutImages = selectedJobs.filter((job) =>
+    isActiveAssetResultJob(job) && !selectedImageCandidates.some((item) => item.job.id === job.id)
+  );
   const normalizedLibraryQuery = libraryQuery.trim().toLocaleLowerCase();
   const filteredProjectImages = projectImageLibrary.filter((item) => {
     const scopeMatches = libraryScope === "all" || item.sourceType === libraryScope;
@@ -836,13 +838,15 @@ function AssetsPage({ data, reload }: { data: DashboardData; reload: () => Promi
         </div>
         <aside className="asset-results-panel">
           <div className="asset-results-heading"><div><h3>该资产的生成结果</h3><span>每张图片都可以单独放大、比较和锁定</span></div><b>{selectedImageCandidates.length} 张可选</b></div>
-          {selectedPendingCodexRequests.map((request) => <article className="codex-request-card result-status-card" key={request.id}><Status value={request.status} /><strong>Codex · gpt-image-2</strong><p>{request.prompt.slice(0, 90)}</p><small>{request.aspectRatio} · {request.quality === "high" ? "高质量" : "标准质量"} · {request.count}张</small><code>{request.id}</code></article>)}
-          {selectedJobsWithoutImages.map((job) => <article className="codex-request-card result-status-card" key={job.id}><Status value={job.status} /><strong>{job.provider === "codex" ? "Codex · gpt-image-2" : job.model}</strong><p>{job.error || job.prompt.slice(0, 90)}</p><small>{job.status === "completed" ? "任务完成，但没有找到本地图片" : `生成进度 ${job.progress}%`}</small></article>)}
-          {selectedImageCandidates.map((item) => { const isMainImage = selected.status === "approved" && selected.approvedJobId === item.job.id && selected.referenceMediaId === item.media.id; const isReference = selected.referenceMediaId === item.media.id; return <article className={clsx("asset-image-candidate", isMainImage && "locked", isReference && !isMainImage && "reference-selected")} key={item.media.id}>
-            <button type="button" className="asset-candidate-preview" onClick={() => setLightboxUrl(`/api/media/${item.media.id}`)}><img loading="lazy" src={`/api/media/${item.media.id}`} alt={`${selected.name}候选图片${item.imageIndex}`} /><span>第 {item.imageIndex} 张 · 点击放大</span>{isMainImage && <b><LockKeyhole size={13} />资产主图</b>}{isReference && !isMainImage && <b className="reference-badge">生成参考图</b>}</button>
-            <div className="asset-candidate-body"><div className="media-status-row"><Status value={item.job.status} /><small>{new Date(item.media.createdAt).toLocaleString()}</small></div><strong>{item.job.provider === "codex" ? "Codex · gpt-image-2" : item.job.model}</strong><p>{item.job.prompt.slice(0, 72)}</p><button type="button" className={isMainImage ? "ghost" : "primary"} disabled={isMainImage || Boolean(lockingAssetMediaId)} onClick={() => lockAssetImage(item.job.id, item.media.id)}>{isMainImage ? <><Check size={15} />主图已锁定</> : lockingAssetMediaId === item.media.id ? "正在锁定…" : <><LockKeyhole size={15} />锁定为资产主图</>}</button></div>
-          </article>; })}
-          {!selectedImageCandidates.length && !selectedJobsWithoutImages.length && !selectedPendingCodexRequests.length && <Empty text="还没有生成结果。确认提示词后可直接生图；生成多张时会在这里逐张展示。" />}
+          <div className="asset-results-scroll" tabIndex={0} aria-label={`${selected.name}可用生成结果`}>
+            {selectedPendingCodexRequests.map((request) => <article className="codex-request-card result-status-card" key={request.id}><Status value={request.status} /><strong>Codex · gpt-image-2</strong><p>{request.prompt.slice(0, 90)}</p><small>{request.aspectRatio} · {request.quality === "high" ? "高质量" : "标准质量"} · {request.count}张</small><code>{request.id}</code></article>)}
+            {selectedActiveJobsWithoutImages.map((job) => <article className="codex-request-card result-status-card" key={job.id}><Status value={job.status} /><strong>{job.provider === "codex" ? "Codex · gpt-image-2" : job.model}</strong><p>{job.prompt.slice(0, 90)}</p><small>生成进度 {job.progress}%</small></article>)}
+            {selectedImageCandidates.map((item) => { const isMainImage = selected.status === "approved" && selected.approvedJobId === item.job.id && selected.referenceMediaId === item.media.id; const isReference = selected.referenceMediaId === item.media.id; return <article className={clsx("asset-image-candidate", isMainImage && "locked", isReference && !isMainImage && "reference-selected")} key={item.media.id}>
+              <button type="button" className="asset-candidate-preview" onClick={() => setLightboxUrl(`/api/media/${item.media.id}`)}><img loading="lazy" src={`/api/media/${item.media.id}`} alt={`${selected.name}候选图片${item.imageIndex}`} /><span>第 {item.imageIndex} 张 · 点击放大</span>{isMainImage && <b><LockKeyhole size={13} />资产主图</b>}{isReference && !isMainImage && <b className="reference-badge">生成参考图</b>}</button>
+              <div className="asset-candidate-body"><div className="media-status-row"><Status value={item.job.status} /><small>{new Date(item.media.createdAt).toLocaleString()}</small></div><strong>{item.job.provider === "codex" ? "Codex · gpt-image-2" : item.job.model}</strong><p>{item.job.prompt.slice(0, 72)}</p><button type="button" className={isMainImage ? "ghost" : "primary"} disabled={isMainImage || Boolean(lockingAssetMediaId)} onClick={() => lockAssetImage(item.job.id, item.media.id)}>{isMainImage ? <><Check size={15} />主图已锁定</> : lockingAssetMediaId === item.media.id ? "正在锁定…" : <><LockKeyhole size={15} />锁定为资产主图</>}</button></div>
+            </article>; })}
+            {!selectedImageCandidates.length && !selectedActiveJobsWithoutImages.length && !selectedPendingCodexRequests.length && <Empty text="还没有可用图片。确认提示词后可直接生图；失败记录请到任务中心查看。" />}
+          </div>
           <section className="asset-item-review"><div><strong>资产确认</strong><span>{selected.status === "approved" ? "主图已锁定，资产已完成" : selected.status === "stale" ? "需要重新选择并锁定主图" : "等待选择资产主图"}</span></div>{selected.status === "approved" ? <p className="asset-lock-success"><LockKeyhole size={14} />当前锁定的是上方带“资产主图”标记的图片，后续分镜会引用它。</p> : selectedImageCandidates.length > 0 ? <p className="asset-review-warning">请比较上方候选图，并直接点击对应图片下方的“锁定为资产主图”。</p> : <p className="asset-review-warning">生成完成后，这里会把同一次任务返回的多张图片逐张列出。</p>}{selectedImageChannelLocked && <p className="asset-review-warning">新任务仍在生成；你可以锁定已有候选图，新任务完成后不会自动替换它。</p>}<label>返工意见<textarea value={assetFeedback} onChange={(e) => setAssetFeedback(e.target.value)} placeholder="例如人物、构图、服装、材质或文字哪里需要修改" /></label><div className="button-row"><button className="danger" disabled={reviewingAsset} onClick={rejectSelectedAsset}>{reviewingAsset ? "正在退回…" : "退回修改"}</button>{selected.status === "approved" && nextPendingAsset && <button className="ghost" onClick={() => setSelectedId(nextPendingAsset.id)}>下一个待确认资产 · {nextPendingAsset.name}</button>}</div></section>
         </aside></div>
     </section></div>}{lightboxUrl && <div className="image-lightbox" onClick={() => setLightboxUrl("")}><button className="icon-button" aria-label="关闭大图"><X /></button><img src={lightboxUrl} alt="参考图大图预览" /></div>}
