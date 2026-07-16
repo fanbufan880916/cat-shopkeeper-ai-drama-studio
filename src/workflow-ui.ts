@@ -9,6 +9,10 @@ export interface StageAction {
   description: string;
 }
 
+export interface NavigationCompletion {
+  audio?: boolean;
+}
+
 const stageActions: Record<WorkflowStage, StageAction> = {
   idea: { section: "script", label: "进入剧本准备", description: "先让编剧 Agent 产出第一版剧本。" },
   script_internal_review: { section: "script", label: "查看内部审核", description: "查看总导演与观众 Agent 的审核进度。" },
@@ -59,13 +63,19 @@ export function getSectionUnlockReason(section: WorkspaceSection) {
   return unlockReason[section] ?? "请先完成当前制作阶段。";
 }
 
-export function getNavigationState(stage: WorkflowStage, section: WorkspaceSection, hasScript = false): StageNavigationState {
+export function getNavigationState(
+  stage: WorkflowStage,
+  section: WorkspaceSection,
+  hasScript = false,
+  completion: NavigationCompletion = {}
+): StageNavigationState {
   if (!canAccessSection(stage, section, hasScript)) return "locked";
   const current = getStageAction(stage).section;
   if (section === current) return "current";
   const index = stageIndex(stage);
   if (section === "script" && index > stageIndex("script_user_review")) return "completed";
   if (section === "assets" && index > stageIndex("asset_user_review")) return "completed";
+  if (section === "audio" && completion.audio) return "completed";
   if (section === "audio" && index >= stageIndex("final_review")) return "completed";
   if (section === "storyboard" && index >= stageIndex("final_review")) return "completed";
   if (section === "preview" && stage === "completed") return "completed";

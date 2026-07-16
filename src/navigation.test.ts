@@ -54,4 +54,9 @@ describe("桌面工作台阶段规则", () => {
     expect(getNavigationState("asset_user_review", "script")).toBe("completed");
     expect(getNavigationState("asset_user_review", "storyboard")).toBe("locked");
   });
+
+  it("全部声音切片确认并绑定后，声音生产导航显示完成", () => {
+    expect(getNavigationState("storyboard_user_review", "audio", true, { audio: false })).toBe("available");
+    expect(getNavigationState("storyboard_user_review", "audio", true, { audio: true })).toBe("completed");
+  });
 });

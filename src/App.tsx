@@ -3,6 +3,7 @@ import { NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams, 
 import { ArrowLeft, ArrowRight, Check, CircleHelp, Clapperboard, CloudDownload, ExternalLink, Film, Images, KeyRound, LayoutDashboard, ListChecks, LockKeyhole, Plus, RefreshCcw, ScrollText, ShieldCheck, Sparkles, Upload, Users, Video, Volume2, X } from "lucide-react";
 import clsx from "clsx";
 import { api } from "./api";
+import { getAudioConfirmationProgress } from "./audio-confirmation";
 import { globalSettingsRoute, projectRoute } from "./navigation";
 import { canAccessSection, getNavigationState, getSectionUnlockReason, getStageAction, sectionPath, type WorkspaceSection } from "./workflow-ui";
 import { assetImageSize, isActiveAssetResultJob } from "./asset-generation";
@@ -329,12 +330,17 @@ function Studio() {
   useEffect(() => { void load(); const source = new EventSource("/api/events"); source.addEventListener("project.updated", load); source.addEventListener("job.updated", load); return () => source.close(); }, [load]);
   if (!data) return <div className="center-screen">{error || "正在打开项目…"}</div>;
   const hasScript = data.artifacts.some((artifact) => artifact.type === "script");
+  const audioConfirmation = getAudioConfirmationProgress(
+    extractLockedScriptDialogue(data.artifacts, data.shots),
+    data.audioClips,
+    data.shots
+  );
   return (
     <div className="studio-shell">
       <aside className="sidebar">
         <NavLink to="/" className="sidebar-brand"><div className="brand-mark small"><Clapperboard /></div><div><strong>猫掌柜</strong><span>AI 漫剧工作台</span></div></NavLink>
         <nav aria-label="项目制作导航">{navigation.map(([section, path, label, Icon]) => {
-          const state = getNavigationState(data.project.stage, section, hasScript);
+          const state = getNavigationState(data.project.stage, section, hasScript, { audio: audioConfirmation.complete });
           const content = <><Icon size={18} /><span className="nav-item-copy"><b>{label}</b>{state === "locked" && <small>{getSectionUnlockReason(section)}</small>}</span>{state === "locked" ? <LockKeyhole className="nav-state-icon" size={14} /> : state === "completed" ? <Check className="nav-state-icon" size={14} /> : null}</>;
           return state === "locked"
             ? <span key={label} className="nav-item locked" aria-disabled="true" title={getSectionUnlockReason(section)}>{content}</span>
@@ -1325,12 +1331,9 @@ function AudioProductionPage({ data, reload }: { data: DashboardData; reload: ()
   const masters = data.audioAssets.filter((asset) => asset.type === "scene_master");
   const selectedMaster = masters.find((asset) => asset.id === selectedMasterId) ?? masters.find((asset) => Boolean(asset.localPath)) ?? masters[0];
   const selectedMasterClipCount = selectedMaster ? data.audioClips.filter((clip) => clip.sourceAudioAssetId === selectedMaster.id).length : 0;
-  const confirmedLineCount = rows.filter((line) => {
-    const clip = data.audioClips.find((item) => item.status === "approved" && item.text === line.text && (!line.shotId || item.shotId === line.shotId));
-    if (!clip?.shotId) return false;
-    return Boolean(data.shots.find((shot) => shot.id === clip.shotId)?.audioAssetIds.includes(clip.audioAssetId));
-  }).length;
-  const allAudioConfirmed = rows.length > 0 && confirmedLineCount === rows.length;
+  const audioConfirmation = getAudioConfirmationProgress(rows, data.audioClips, data.shots);
+  const confirmedLineCount = audioConfirmation.confirmed;
+  const allAudioConfirmed = audioConfirmation.complete;
   const update = (id: string, patch: Partial<DialogueDraft>) => setDrafts((current) => ({ ...current, [id]: { ...(current[id] ?? lines.find((line) => line.id === id)!), ...patch } }));
   async function generateMaster() {
     if (busyId) return;
