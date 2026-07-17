@@ -721,14 +721,14 @@ describe("storyboard production contracts", () => {
     expect(store.dashboard(project.id).shots[0]).toMatchObject({ approvedVideoJobId: job.id, lastFrameMediaId: lastFrame, observedEndState: "角色站在门右侧，手扶门把", observedAudioState: "台词说话人正确，口型同步" });
   });
 
-  it("attaches rights-cleared dialogue audio to a lip-sync video request", async () => {
+  it("keeps dialogue lip-sync as history and blocks new submissions", async () => {
     const project = store.createProject({ name: `shot-audio-${Date.now()}` });
     testProjectIds.push(project.id);
     store.setStage(project.id, "sample_video");
     store.setSetting("apimart_api_key", encryptSecret("sk-test-placeholder"));
     const stamp = new Date().toISOString();
     const audioId = `aud_dialogue_${Date.now()}`;
-    db.prepare("INSERT INTO audio_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(audioId, project.id, "dialogue_line", "猫掌柜台词", null, "", "https://example.com/dialogue.wav", 4.2, "本人录制并授权使用", "干声台词", stamp, stamp);
+    db.prepare("INSERT INTO audio_assets (id,project_id,type,name,character_asset_id,local_path,remote_url,duration,rights_note,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(audioId, project.id, "dialogue_line", "猫掌柜台词", null, "", "https://example.com/dialogue.wav", 4.2, "本人录制并授权使用", "干声台词", stamp, stamp);
     const shot = store.upsertShot(project.id, { shotNumber: 1, title: "对白", duration: 5, videoPrompt: "猫掌柜正对镜头说话。", plannedEndState: "猫掌柜说完后停顿",
       audioMode: "dialogue_lipsync", audioAssetIds: [audioId], speakerMap: "猫掌柜说完整台词", lipSyncNotes: "稳定中近景，不转头" });
     const image = completedImage(project.id, shot.id);
@@ -739,8 +739,8 @@ describe("storyboard production contracts", () => {
       params: { size: "9:16", resolution: "720p", duration: 5, generate_audio: true }
     } });
 
-    expect(response.statusCode).toBe(201);
-    expect(response.json().params).toMatchObject({ audio_urls: ["https://example.com/dialogue.wav"], audio_reference_mode: "dialogue_lipsync", first_frame_media_id: image.mediaId });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().error).toContain("只保留历史兼容");
   });
 
   it("blocks local-only audio and audio references longer than fifteen seconds", async () => {
@@ -750,7 +750,7 @@ describe("storyboard production contracts", () => {
     store.setSetting("apimart_api_key", encryptSecret("sk-test-placeholder"));
     const stamp = new Date().toISOString();
     const localOnlyId = `aud_local_${Date.now()}`;
-    db.prepare("INSERT INTO audio_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(localOnlyId, project.id, "music", "本地音乐", null, "E:\\music.mp3", "", 8, "已获商用授权", "", stamp, stamp);
+    db.prepare("INSERT INTO audio_assets (id,project_id,type,name,character_asset_id,local_path,remote_url,duration,rights_note,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(localOnlyId, project.id, "music", "本地音乐", null, "E:\\music.mp3", "", 8, "已获商用授权", "", stamp, stamp);
     const shot = store.upsertShot(project.id, { shotNumber: 1, title: "MV", duration: 8, videoPrompt: "角色按节拍表演。", audioMode: "music_sync", audioAssetIds: [localOnlyId] });
     const image = completedImage(project.id, shot.id);
     await app.inject({ method: "POST", url: `/api/shots/${shot.id}/lock-image`, payload: { jobId: image.job.id, mediaId: image.mediaId } });
@@ -759,7 +759,7 @@ describe("storyboard production contracts", () => {
       params: { size: "9:16", resolution: "720p", duration: 8, generate_audio: true }
     } });
     expect(localOnly.statusCode).toBe(400);
-    expect(localOnly.json().error).toContain("没有 APIMart 可访问的 HTTPS URL");
+    expect(localOnly.json().error).toContain("缺少Seedance可访问的地址");
 
     db.prepare("UPDATE audio_assets SET remote_url=?,duration=? WHERE id=?").run("https://example.com/full-song.mp3", 18, localOnlyId);
     const tooLong = await app.inject({ method: "POST", url: `/api/projects/${project.id}/jobs`, payload: {
@@ -767,7 +767,122 @@ describe("storyboard production contracts", () => {
       params: { size: "9:16", resolution: "720p", duration: 8, generate_audio: true }
     } });
     expect(tooLong.statusCode).toBe(400);
-    expect(tooLong.json().error).toContain("总时长超过 15 秒");
+    expect(tooLong.json().error).toContain("总时长超过15秒");
+  });
+});
+
+describe("voice anchors and first-frame revisions", () => {
+  function completedImage(projectId: string, shotId: string) {
+    const job = store.addJob({ projectId, shotId, assetId: null, audioAssetId: null, kind: "image", provider: "mock", model: "gpt-image-2", prompt: "首帧", params: {} });
+    store.updateJob(job.id, { status: "completed", progress: 100, output: { localPaths: [`.data/media/${job.id}.png`] } });
+    const mediaId = `med_voice_image_${Date.now()}_${Math.random()}`;
+    db.prepare("INSERT INTO media_files VALUES (?,?,?,?,?,?,?,?,?)").run(mediaId, projectId, job.id, "image", `.data/media/${job.id}.png`, "", null, "{}", new Date().toISOString());
+    return { job, mediaId };
+  }
+
+  function insertVoice(projectId: string, characterAssetId: string, patch: { id: string; status?: string; seedanceAssetUrl?: string; duration?: number }) {
+    const stamp = new Date().toISOString();
+    db.prepare(`INSERT INTO audio_assets (id,project_id,type,name,character_asset_id,local_path,remote_url,duration,rights_note,description,status,version,source_job_id,source_expires_at,voice_profile_hash,seedance_asset_url,registration_job_id,locked_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      patch.id, projectId, "character_voice", `${characterAssetId}音色`, characterAssetId, `E:\\voices\\${patch.id}.wav`, `https://example.com/${patch.id}.wav`, patch.duration ?? 5,
+      "本人拥有并授权本项目使用", "4到5秒单人干声", patch.status ?? "draft", 1, null, null, `hash-${patch.id}`, patch.seedanceAssetUrl ?? "", null,
+      patch.status === "locked" ? stamp : null, stamp, stamp
+    );
+  }
+
+  it("locks a voice candidate and only creates Seedance registration after explicit confirmation", async () => {
+    const project = store.createProject({ name: `voice-register-${Date.now()}` });
+    testProjectIds.push(project.id);
+    store.setSetting("apimart_api_key", encryptSecret("sk-test-placeholder"));
+    const characterAsset = store.upsertAsset(project.id, { type: "character", name: "小曼 - 女高中生", prompt: validCharacterPrompt });
+    const audioId = `aud_voice_${Date.now()}`;
+    insertVoice(project.id, characterAsset.id, { id: audioId });
+
+    const impact = await app.inject({ method: "GET", url: `/api/audio-assets/${audioId}/lock-impact` });
+    expect(impact.statusCode).toBe(200);
+    expect(impact.json()).toMatchObject({ characterAssetId: characterAsset.id, replacingAudioId: null });
+
+    const locked = await app.inject({ method: "POST", url: `/api/audio-assets/${audioId}/lock-voice`, payload: { confirmInvalidation: false } });
+    expect(locked.statusCode).toBe(200);
+    expect(store.dashboard(project.id).audioAssets.find((item) => item.id === audioId)?.status).toBe("locked");
+
+    const blocked = await app.inject({ method: "POST", url: `/api/audio-assets/${audioId}/register-seedance` });
+    expect(blocked.statusCode).toBe(400);
+    expect(blocked.json().error).toContain("明确点击");
+
+    const registered = await app.inject({
+      method: "POST", url: `/api/audio-assets/${audioId}/register-seedance`,
+      headers: { "x-workbench-paid-confirm": "register-seedance-voice" }
+    });
+    expect(registered.statusCode).toBe(202);
+    expect(registered.json().job).toMatchObject({ kind: "audio_registration", audioAssetId: audioId, params: { asset_type: "Audio", url: `https://example.com/${audioId}.wav` } });
+  });
+
+  it("builds dialogue video jobs from locked asset voices and stores an immutable snapshot", async () => {
+    const project = store.createProject({ name: `voice-video-${Date.now()}` });
+    testProjectIds.push(project.id);
+    store.setStage(project.id, "sample_video");
+    store.setSetting("apimart_api_key", encryptSecret("sk-test-placeholder"));
+    const characterAsset = store.upsertAsset(project.id, { type: "character", name: "小曼 - 女高中生", prompt: validCharacterPrompt });
+    const audioId = `aud_ready_${Date.now()}`;
+    insertVoice(project.id, characterAsset.id, { id: audioId, status: "locked", seedanceAssetUrl: "asset://voice/xiaoman" });
+    const shot = store.upsertShot(project.id, {
+      shotNumber: 1, title: "小曼对白", duration: 5, videoPrompt: "稳定中近景，小曼看向阿杰。", dialogue: "小曼：你今天，不一样。",
+      audioMode: "voice_reference", voiceBindings: [{ speaker: "小曼", characterAssetId: characterAsset.id }], plannedEndState: "小曼说完后停顿"
+    });
+    const image = completedImage(project.id, shot.id);
+    await app.inject({ method: "POST", url: `/api/shots/${shot.id}/lock-image`, payload: { jobId: image.job.id, mediaId: image.mediaId } });
+
+    const response = await app.inject({ method: "POST", url: `/api/projects/${project.id}/jobs`, payload: {
+      shotId: shot.id, kind: "video", provider: "apimart", model: "doubao-seedance-2.0", prompt: shot.videoPrompt,
+      params: { size: "9:16", resolution: "720p", duration: 5, generate_audio: true }
+    } });
+    expect(response.statusCode).toBe(201);
+    expect(response.json().prompt).toContain("@Audio1 仅提供小曼的年龄感、音色、口音和说话质感，不复用示例台词");
+    expect(response.json().prompt).toContain("小曼用@Audio1的音色说：“你今天，不一样。”");
+    expect(response.json().params.audio_urls).toEqual(["asset://voice/xiaoman"]);
+    expect(response.json().params.voice_anchor_snapshot).toEqual([expect.objectContaining({ audioAssetId: audioId, version: 1, seedanceAssetUrl: "asset://voice/xiaoman" })]);
+  });
+
+  it("requires first-frame feedback, preserves history, and invalidates seamless downstream video state", async () => {
+    const project = store.createProject({ name: `image-revision-${Date.now()}` });
+    testProjectIds.push(project.id);
+    store.setStage(project.id, "batch_generation");
+    const rootShot = store.upsertShot(project.id, { shotNumber: 1, title: "退回首帧", duration: 5 });
+    const childShot = store.upsertShot(project.id, { shotNumber: 2, title: "无缝下游", duration: 5, parentShotId: rootShot.id, sequenceRelation: "seamless_continuation" });
+    const historicalImage = completedImage(project.id, rootShot.id);
+    await app.inject({ method: "POST", url: `/api/shots/${rootShot.id}/lock-image`, payload: { jobId: historicalImage.job.id, mediaId: historicalImage.mediaId } });
+    db.prepare("UPDATE shots SET status='approved',approved_video_job_id='old-video-job',last_frame_media_id='old-tail',observed_end_state='旧结束' WHERE id=?").run(rootShot.id);
+    db.prepare("UPDATE shots SET status='approved',approved_image_job_id='child-image-job',approved_image_media_id='child-image-media',approved_video_job_id='child-video-job',last_frame_media_id='child-tail',observed_end_state='下游结束' WHERE id=?").run(childShot.id);
+
+    const blank = await app.inject({ method: "POST", url: `/api/shots/${rootShot.id}/image-revision`, payload: { feedback: "" } });
+    expect(blank.statusCode).toBe(400);
+    expect(blank.json().error).toContain("必须填写具体修改意见");
+
+    const revised = await app.inject({ method: "POST", url: `/api/shots/${rootShot.id}/image-revision`, payload: { feedback: "人物脸型不一致，站位太靠右。" } });
+    expect(revised.statusCode).toBe(201);
+    expect(revised.json().affectedShots).toEqual(expect.arrayContaining([expect.objectContaining({ id: rootShot.id, downstream: false }), expect.objectContaining({ id: childShot.id, downstream: true })]));
+    const current = store.dashboard(project.id).shots;
+    expect(current.find((item) => item.id === rootShot.id)).toMatchObject({ approvedImageMediaId: null, approvedVideoJobId: null, lastFrameMediaId: null, status: "stale" });
+    expect(current.find((item) => item.id === childShot.id)).toMatchObject({ approvedImageMediaId: "child-image-media", approvedVideoJobId: null, lastFrameMediaId: null, status: "stale" });
+    expect(store.dashboard(project.id).mediaFiles.some((item) => item.id === historicalImage.mediaId)).toBe(true);
+
+    const openBeforeLock = await app.inject({ method: "GET", url: `/api/projects/${project.id}/revisions/open` });
+    expect(openBeforeLock.json()).toEqual([expect.objectContaining({ target_type: "image", target_id: rootShot.id, category: "镜头首帧退回" })]);
+    const replacement = completedImage(project.id, rootShot.id);
+    await app.inject({ method: "POST", url: `/api/shots/${rootShot.id}/lock-image`, payload: { jobId: replacement.job.id, mediaId: replacement.mediaId } });
+    const openAfterLock = await app.inject({ method: "GET", url: `/api/projects/${project.id}/revisions/open` });
+    expect(openAfterLock.json()).toEqual([]);
+  });
+
+  it("records feedback without clearing media when no first frame was locked", async () => {
+    const project = store.createProject({ name: `image-revision-unlocked-${Date.now()}` });
+    testProjectIds.push(project.id);
+    store.setStage(project.id, "storyboard_design");
+    const shot = store.upsertShot(project.id, { shotNumber: 1, title: "未锁首帧", duration: 5 });
+    const revised = await app.inject({ method: "POST", url: `/api/shots/${shot.id}/image-revision`, payload: { feedback: "构图太挤，需要增加人物周围留白。" } });
+    expect(revised.statusCode).toBe(201);
+    expect(store.dashboard(project.id).shots[0]).toMatchObject({ status: "stale", approvedImageMediaId: null, approvedVideoJobId: null });
   });
 });
 
@@ -874,7 +989,7 @@ describe("Volcengine audio generation", () => {
     const localPath = path.join(mediaDir, `${audioId}.wav`);
     fs.writeFileSync(localPath, "obsolete audio");
     const stamp = new Date().toISOString();
-    db.prepare("INSERT INTO audio_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(audioId, project.id, "scene_master", "错误母带", null, localPath, "", 3, "本人授权", "", stamp, stamp);
+    db.prepare("INSERT INTO audio_assets (id,project_id,type,name,character_asset_id,local_path,remote_url,duration,rights_note,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(audioId, project.id, "scene_master", "错误母带", null, localPath, "", 3, "本人授权", "", stamp, stamp);
     const shot = store.upsertShot(project.id, { shotNumber: 1, title: "引用错误母带", audioMode: "dialogue_lipsync", audioAssetIds: [audioId] });
     const response = await app.inject({ method: "DELETE", url: `/api/audio-assets/${audioId}` });
     expect(response.statusCode).toBe(200);
@@ -892,7 +1007,7 @@ describe("Volcengine audio generation", () => {
     const masterPath = path.join(mediaDir, `${masterId}.wav`);
     fs.writeFileSync(masterPath, "mock master");
     const stamp = new Date().toISOString();
-    db.prepare("INSERT INTO audio_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(masterId, project.id, "scene_master", "测试母带", null, masterPath, "", 10, "本人授权", "", stamp, stamp);
+    db.prepare("INSERT INTO audio_assets (id,project_id,type,name,character_asset_id,local_path,remote_url,duration,rights_note,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(masterId, project.id, "scene_master", "测试母带", null, masterPath, "", 10, "本人授权", "", stamp, stamp);
     const shot = store.upsertShot(project.id, { shotNumber: 1, title: "测试对白", dialogue: "小曼：你好。" });
     const response = await app.inject({
       method: "POST",

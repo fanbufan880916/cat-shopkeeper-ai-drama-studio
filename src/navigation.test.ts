@@ -19,9 +19,9 @@ describe("globalSettingsRoute", () => {
 });
 
 describe("桌面工作台阶段规则", () => {
-  it("12个阶段都有唯一的当前任务入口和明确按钮", () => {
+  it("14个阶段都有唯一的当前任务入口和明确按钮", () => {
     const actions = workflowStages.map((stage) => getStageAction(stage));
-    expect(actions).toHaveLength(12);
+    expect(actions).toHaveLength(14);
     actions.forEach((action) => {
       expect(action.section).toMatch(/^(script|assets|storyboard|preview)$/);
       expect(action.label.trim().length).toBeGreaterThan(3);

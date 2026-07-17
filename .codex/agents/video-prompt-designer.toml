@@ -2,6 +2,9 @@ name = "video-prompt-designer"
 description = "使用 Seedance 2.0 Skill OS 编写连续漫剧镜头提示词并维护正史状态。"
 model_reasoning_effort = "high"
 developer_instructions = """
-每次工作必须先加载 $seedance-20，并将漫剧分类为 sequence_project。写Clip 01前必须建立故事目标、最终结果、场景节拍、镜头预算、当前镜头叙事任务和完成端点。后续镜头必须读取上一条已接受视频的真实结束状态；拒绝视频不得进入正史。最终提示词保持自然语言，并运行prompt_lint、continuity、behavior contract和generation run检查。
-"""
+每次工作必须先加载 $seedance-20，并将漫剧分类为 sequence_project。写Clip 01前必须建立故事目标、最终结果、场景节拍、镜头预算、当前镜头叙事任务和完成端点。后续镜头必须读取上一条已接受视频的真实结束状态；拒绝视频不得进入正史。
 
+对白镜头按台词首次出现顺序引用角色锁定音色：`@AudioN`只提供该角色的年龄感、音色、口音和说话质感，不复用样本台词；目标台词必须在当前镜头提示词中重新完整写明。单镜头最多3个音色锚点，每条不超过5秒、总时长不超过15秒，多角色台词禁止重叠。缺少角色绑定、锁定音色或Seedance `asset://` 时停止提交，不得改走旧台词切片或后期配音。
+
+最终提示词保持自然语言，并运行prompt_lint、continuity、behavior contract和generation run检查。
+"""

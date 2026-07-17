@@ -9,7 +9,7 @@ import { imageModelOption, imageModelParams, imageModelOptions } from "../shared
 import { isVideoResolution, videoModelOption, videoModelOptions } from "../shared/video-models.js";
 import { encryptSecret, decryptSecret } from "./crypto.js";
 import { db, store } from "./db.js";
-import { mediaDir, uploadDir } from "./paths.js";
+import { deliveryRoot, mediaDir, uploadDir } from "./paths.js";
 import { asJson, id, now } from "./utils.js";
 import { addEventClient, emitEvent } from "./events.js";
 import { buildPreview } from "./preview.js";
@@ -19,8 +19,11 @@ import { VolcengineAudioProvider } from "./providers/volcengine-audio.js";
 import { assertArtifactWriteAllowed, assertGateAllowed, assertShotWriteAllowed, assertVisualStyleLocked, scoresPass } from "./workflow.js";
 import { assertNoActiveImageGeneration } from "./image-generation-lock.js";
 import { cutAudioClip } from "./audio-clips.js";
-import { inferAudioStyleProfile, validateAudioPrompt } from "../shared/audio-prompt.js";
+import { inferAudioStyleProfile, validateAudioPrompt, validateVoiceAnchorPrompt } from "../shared/audio-prompt.js";
+import { inferShotVoiceBindings, parseShotDialogue } from "../shared/voice-anchors.js";
+import { invalidateShotCascade, lockVoiceAnchor, resolveShotVoiceReferences, voiceLockImpact, voiceProfileHash, voiceSnapshot } from "./voice-anchors.js";
 import { applyWorkbenchUpdate, inspectWorkbenchUpdate } from "./workbench-update.js";
+import { getJianyingConfig, saveJianyingConfig } from "./jianying.js";
 
 let updateInProgress = false;
 
@@ -196,8 +199,14 @@ export async function registerRoutes(app: FastifyInstance) {
       if (incomplete.length) throw new Error(`还有 ${incomplete.length} 个资产没有逐项确认：${incomplete.slice(0, 4).map((asset) => asset.name).join("、")}${incomplete.length > 4 ? "等" : ""}。`);
     }
     if (body.gate === "storyboard_user" && body.decision === "approved") {
-      const shotCount = Number((db.prepare("SELECT COUNT(*) AS count FROM shots WHERE project_id=?").get(projectId) as { count: number }).count);
-      if (!shotCount) throw new Error("当前完整分镜没有镜头，不能通过审核。");
+      const shots = store.dashboard(projectId).shots;
+      if (!shots.length) throw new Error("当前完整分镜没有镜头，不能通过审核。");
+      for (const shot of shots.filter((item) => item.dialogue.trim())) {
+        const speakers = [...new Set(parseShotDialogue(shot.dialogue, shot.speakerMap).map((line) => line.speaker))];
+        if (speakers.length > 3) throw new Error(`镜头${shot.shotNumber}有${speakers.length}个说话角色，超过Seedance单镜头最多3个音色的限制，请拆分镜头。`);
+        const missing = speakers.filter((speaker) => !shot.voiceBindings.some((binding) => binding.speaker === speaker && binding.characterAssetId));
+        if (missing.length) throw new Error(`镜头${shot.shotNumber}缺少说话人角色绑定：${missing.join("、")}。`);
+      }
     }
     const review = store.addReview({ projectId, artifactId: body.artifactId ?? null, gate: body.gate, decision: body.decision, scores: body.scores, feedback: body.feedback });
     if (body.decision === "rejected") {
@@ -366,9 +375,14 @@ export async function registerRoutes(app: FastifyInstance) {
       feltIntent: z.string().default(""), plannedStartState: z.string().default(""), plannedEndState: z.string().default(""),
       alreadyHappened: z.string().default(""), reservedForLater: z.string().default(""), continuityLocks: z.string().default(""),
       allowedChanges: z.string().default(""), audioMode: z.enum(["generated", "voice_reference", "dialogue_lipsync", "music_sync", "silent"]).default("generated"),
-      audioAssetIds: z.array(z.string()).max(3).default([]), videoReferenceMediaIds: z.array(z.string()).max(3).default([]), speakerMap: z.string().default(""), audioDirection: z.string().default(""),
+      audioAssetIds: z.array(z.string()).max(3).default([]), voiceBindings: z.array(z.object({ speaker: z.string().min(1), characterAssetId: z.string().default("") })).optional(),
+      videoReferenceMediaIds: z.array(z.string()).max(3).default([]), speakerMap: z.string().default(""), audioDirection: z.string().default(""),
       lipSyncNotes: z.string().default(""), observedEndState: z.string().default("") }).parse(request.body);
-    const shot = store.upsertShot(projectId, body);
+    const existing = body.id ? store.dashboard(projectId).shots.find((shot) => shot.id === body.id) : undefined;
+    const characterAssets = store.dashboard(projectId).assets;
+    const voiceBindings = body.voiceBindings ?? inferShotVoiceBindings(body.dialogue, body.speakerMap, characterAssets, existing?.voiceBindings ?? []);
+    const audioMode = body.dialogue.trim() && !existing?.approvedVideoJobId && ["generated", "silent", "dialogue_lipsync"].includes(body.audioMode) ? "voice_reference" : body.audioMode;
+    const shot = store.upsertShot(projectId, { ...body, audioMode, voiceBindings });
     emitEvent("project.updated", { projectId });
     return reply.code(201).send(shot);
   });
@@ -395,23 +409,76 @@ export async function registerRoutes(app: FastifyInstance) {
       localPath = path.join(uploadDir, `audio-${Date.now()}-${id("aud")}${ext}`);
       await fs.promises.writeFile(localPath, audioFile.buffer);
     }
+    if (body.type === "character_voice") {
+      if (!body.characterAssetId) throw new Error("角色音色必须绑定一个角色资产。");
+      const character = db.prepare("SELECT id FROM assets WHERE id=? AND project_id=? AND type='character'").get(body.characterAssetId, projectId);
+      if (!character) throw new Error("角色音色绑定的角色资产不存在。");
+      if (body.duration && (body.duration < 4 || body.duration > 5.5)) throw new Error("角色音色样本必须为4到5秒。");
+    }
     const stamp = now();
     const audioId = id("aud");
-    db.prepare("INSERT INTO audio_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(audioId, projectId, body.type, body.name, body.characterAssetId || null,
-      localPath, body.remoteUrl, body.duration, body.rightsNote, body.description, stamp, stamp);
+    const version = body.type === "character_voice" ? Number((db.prepare("SELECT COALESCE(MAX(version),0)+1 AS version FROM audio_assets WHERE project_id=? AND type='character_voice' AND character_asset_id=?").get(projectId, body.characterAssetId) as { version: number }).version) : 1;
+    const profileHash = body.type === "character_voice" ? voiceProfileHash({ projectId, characterAssetId: body.characterAssetId, prompt: body.description || body.name }) : "";
+    db.prepare(`INSERT INTO audio_assets (id,project_id,type,name,character_asset_id,local_path,remote_url,duration,rights_note,description,status,version,source_job_id,source_expires_at,voice_profile_hash,seedance_asset_url,registration_job_id,locked_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(audioId, projectId, body.type, body.name, body.characterAssetId || null,
+      localPath, body.remoteUrl, body.duration, body.rightsNote, body.description, "draft", version, null, null, profileHash, "", null, null, stamp, stamp);
     emitEvent("project.updated", { projectId });
     return reply.code(201).send({ id: audioId, localPath, remoteUrl: body.remoteUrl });
   });
 
   app.put("/api/audio-assets/:audioId", async (request) => {
     const { audioId } = request.params as { audioId: string };
-    const body = z.object({ remoteUrl: z.string().default(""), rightsNote: z.string().min(1), description: z.string().default("") }).parse(request.body);
+    const body = z.object({ remoteUrl: z.string().default(""), duration: z.number().min(0).max(900).optional(), rightsNote: z.string().min(1), description: z.string().default("") }).parse(request.body);
     if (body.remoteUrl && !/^https:\/\//i.test(body.remoteUrl)) throw new Error("远程音频地址必须是 HTTPS URL。");
-    const asset = db.prepare("SELECT project_id FROM audio_assets WHERE id=?").get(audioId) as { project_id: string } | undefined;
+    const asset = db.prepare("SELECT project_id,status,remote_url,duration,type FROM audio_assets WHERE id=?").get(audioId) as { project_id: string; status: string; remote_url: string; duration: number; type: string } | undefined;
     if (!asset) throw new Error("声音资产不存在。");
-    db.prepare("UPDATE audio_assets SET remote_url=?,rights_note=?,description=?,updated_at=? WHERE id=?").run(body.remoteUrl, body.rightsNote, body.description, now(), audioId);
+    const duration = body.duration ?? asset.duration;
+    if (asset.type === "character_voice" && duration && (duration < 4 || duration > 5.5)) throw new Error("角色音色样本必须为4到5秒。");
+    if (asset.status === "locked" && (body.remoteUrl !== asset.remote_url || duration !== asset.duration)) throw new Error("已锁定音色不能直接替换源文件；请创建新候选后再更换锁定音色。");
+    db.prepare("UPDATE audio_assets SET remote_url=?,duration=?,rights_note=?,description=?,updated_at=? WHERE id=?").run(body.remoteUrl, duration, body.rightsNote, body.description, now(), audioId);
     emitEvent("project.updated", { projectId: asset.project_id });
     return { ok: true };
+  });
+
+  app.get("/api/audio-assets/:audioId/lock-impact", async (request) => {
+    const { audioId } = request.params as { audioId: string };
+    return voiceLockImpact(audioId);
+  });
+
+  app.post("/api/audio-assets/:audioId/lock-voice", async (request) => {
+    const { audioId } = request.params as { audioId: string };
+    const body = z.object({ confirmInvalidation: z.boolean().default(false) }).parse(request.body ?? {});
+    const result = lockVoiceAnchor(audioId, body.confirmInvalidation);
+    emitEvent("project.updated", { projectId: result.projectId });
+    return result;
+  });
+
+  app.post("/api/audio-assets/:audioId/register-seedance", async (request, reply) => {
+    const { audioId } = request.params as { audioId: string };
+    if (request.headers["x-workbench-paid-confirm"] !== "register-seedance-voice") throw new Error("只有在声音页面明确点击“提交Seedance审核”后才能注册付费素材。");
+    const audio = db.prepare("SELECT * FROM audio_assets WHERE id=?").get(audioId) as Record<string, unknown> | undefined;
+    if (!audio) throw new Error("角色音色不存在。");
+    const projectId = String(audio.project_id);
+    const project = store.getProject(projectId);
+    if (project.dryRun) throw new Error("空跑测试项目不会提交真实Seedance音色审核。");
+    if (String(audio.type) !== "character_voice" || String(audio.status) !== "locked") throw new Error("必须先试听并锁定角色音色，才能提交Seedance审核。");
+    if (String(audio.seedance_asset_url ?? "").startsWith("asset://")) return { ok: true, alreadyReady: true, seedanceAssetUrl: String(audio.seedance_asset_url) };
+    if (!store.getSetting("apimart_api_key")) throw new Error("尚未配置APIMart API Key，请先前往全局设置。");
+    const sourceUrl = String(audio.remote_url ?? "");
+    if (!/^https:\/\//i.test(sourceUrl)) throw new Error("当前音色只有本地试听文件，不能提交Seedance；请填写你有权使用的HTTPS样本地址。");
+    const duration = Number(audio.duration ?? 0);
+    if (duration < 4 || duration > 5.5) throw new Error("Seedance音色样本必须为4到5秒。");
+    if (!String(audio.rights_note ?? "").trim()) throw new Error("请先填写音色样本权利说明。");
+    if (audio.source_expires_at && new Date(String(audio.source_expires_at)).getTime() <= Date.now() + 5 * 60_000) throw new Error("音色样本的HTTPS地址即将过期，请重新生成或填写新的可访问地址。");
+    if (audio.registration_job_id) {
+      const existing = store.getJob(String(audio.registration_job_id));
+      if (["draft", "submitted", "processing"].includes(existing.status)) return reply.code(202).send({ audioAssetId: audioId, job: existing, alreadyProcessing: true });
+    }
+    const job = store.addJob({ projectId, shotId: null, assetId: null, audioAssetId: audioId, kind: "audio_registration", provider: "apimart", model: "seedance-private-audio", prompt: "",
+      params: { project_name: project.name, asset_type: "Audio", url: sourceUrl, name: String(audio.name) } });
+    db.prepare("UPDATE audio_assets SET registration_job_id=?,updated_at=? WHERE id=?").run(job.id, now(), audioId);
+    emitEvent("job.updated", { projectId, jobId: job.id });
+    return reply.code(202).send({ audioAssetId: audioId, job });
   });
 
   app.delete("/api/audio-assets/:audioId", async (request) => {
@@ -446,23 +513,39 @@ export async function registerRoutes(app: FastifyInstance) {
       rightsNote: z.string().min(1),
       description: z.string().default("")
     }).parse(request.body);
-    const effectiveStyle = body.styleProfile === "auto" ? inferAudioStyleProfile(body.textPrompt) : body.styleProfile;
-    if (body.type === "scene_master" || body.type === "dialogue_line") {
+    const lockedScript = db.prepare("SELECT content_json FROM artifacts WHERE project_id=? AND type='script' AND status='locked' ORDER BY version DESC LIMIT 1").get(projectId) as { content_json: string } | undefined;
+    const scriptContent = lockedScript ? JSON.parse(lockedScript.content_json) as unknown : null;
+    const effectiveStyle = body.styleProfile === "auto" ? inferAudioStyleProfile(scriptContent) : body.styleProfile;
+    if (body.type === "character_voice") {
+      if (!body.characterAssetId) throw new Error("角色音色候选必须绑定角色资产。");
+      const character = db.prepare("SELECT id FROM assets WHERE id=? AND project_id=? AND type='character'").get(body.characterAssetId, projectId);
+      if (!character) throw new Error("角色音色绑定的角色资产不存在。");
+      const promptErrors = validateVoiceAnchorPrompt(body.textPrompt, effectiveStyle);
+      if (promptErrors.length) throw new Error(`角色音色提示词未通过检查：${promptErrors.join("；")}`);
+    } else if (body.type === "scene_master" || body.type === "dialogue_line") {
       const promptErrors = validateAudioPrompt(body.textPrompt, effectiveStyle);
       if (promptErrors.length) throw new Error(`音频提示词未通过检查：${promptErrors.join("；")}`);
     }
     let audioAssetId = body.audioAssetId ?? "";
-    if (audioAssetId) {
+    if (body.type === "character_voice") {
+      audioAssetId = id("aud");
+      const stamp = now();
+      const version = Number((db.prepare("SELECT COALESCE(MAX(version),0)+1 AS version FROM audio_assets WHERE project_id=? AND type='character_voice' AND character_asset_id=?").get(projectId, body.characterAssetId) as { version: number }).version);
+      db.prepare(`INSERT INTO audio_assets (id,project_id,type,name,character_asset_id,local_path,remote_url,duration,rights_note,description,status,version,source_job_id,source_expires_at,voice_profile_hash,seedance_asset_url,registration_job_id,locked_at,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(audioAssetId, projectId, body.type, body.name, body.characterAssetId, "", "", 0, body.rightsNote, body.description,
+        "draft", version, null, null, voiceProfileHash({ projectId, characterAssetId: body.characterAssetId, prompt: body.textPrompt }), "", null, null, stamp, stamp);
+    } else if (audioAssetId) {
       const existing = db.prepare("SELECT id FROM audio_assets WHERE id=? AND project_id=?").get(audioAssetId, projectId);
       if (!existing) throw new Error("指定的声音资产不属于当前项目。");
       db.prepare("UPDATE audio_assets SET name=?,type=?,character_asset_id=?,rights_note=?,description=?,updated_at=? WHERE id=?").run(body.name, body.type, body.characterAssetId || null, body.rightsNote, body.description, now(), audioAssetId);
     } else {
       audioAssetId = id("aud");
       const stamp = now();
-      db.prepare("INSERT INTO audio_assets VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(audioAssetId, projectId, body.type, body.name, body.characterAssetId || null, "", "", 0, body.rightsNote, body.description, stamp, stamp);
+      db.prepare("INSERT INTO audio_assets (id,project_id,type,name,character_asset_id,local_path,remote_url,duration,rights_note,description,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)").run(audioAssetId, projectId, body.type, body.name, body.characterAssetId || null, "", "", 0, body.rightsNote, body.description, stamp, stamp);
     }
-    const job = store.addJob({ projectId, shotId: null, assetId: null, kind: "audio", provider: "volcengine", model: "seed-audio-1.0", prompt: body.textPrompt,
-      params: { audioAssetId, styleProfile: effectiveStyle, speaker: body.speaker || undefined, referenceAudioUrls: body.referenceAudioUrls, format: body.format, sampleRate: body.sampleRate, enableSubtitle: body.enableSubtitle, speechRate: body.speechRate, pitchRate: body.pitchRate, loudnessRate: body.loudnessRate, propagateId: body.propagateId || undefined, contentProducer: body.contentProducer, contentPropagator: body.contentPropagator, aigcWatermark: body.aigcWatermark, enableWatermark: body.enableWatermark } });
+    const job = store.addJob({ projectId, shotId: null, assetId: null, audioAssetId, kind: "audio", provider: "volcengine", model: "seed-audio-1.0", prompt: body.textPrompt,
+      params: { audioAssetId, styleProfile: effectiveStyle, speaker: body.speaker || undefined, referenceAudioUrls: body.referenceAudioUrls, format: body.format, sampleRate: body.sampleRate, enableSubtitle: body.type === "character_voice" ? false : body.enableSubtitle, speechRate: body.speechRate, pitchRate: body.pitchRate, loudnessRate: body.loudnessRate, propagateId: body.propagateId || undefined, contentProducer: body.contentProducer, contentPropagator: body.contentPropagator, aigcWatermark: body.aigcWatermark, enableWatermark: body.enableWatermark } });
+    db.prepare("UPDATE audio_assets SET source_job_id=?,updated_at=? WHERE id=?").run(job.id, now(), audioAssetId);
     emitEvent("job.updated", { projectId, jobId: job.id });
     return reply.code(202).send({ audioAssetId, job });
   });
@@ -592,15 +675,12 @@ export async function registerRoutes(app: FastifyInstance) {
     const projectId = String(clip.project_id);
     const shotId = body.shotId !== undefined ? body.shotId : (clip.shot_id ? String(clip.shot_id) : null);
     if (shotId) {
-      const shot = db.prepare("SELECT id,audio_asset_ids_json FROM shots WHERE id=? AND project_id=?").get(shotId, projectId) as { id: string; audio_asset_ids_json: string } | undefined;
+      const shot = db.prepare("SELECT id FROM shots WHERE id=? AND project_id=?").get(shotId, projectId) as { id: string } | undefined;
       if (!shot) throw new Error("指定镜头不存在或不属于当前项目。");
-      const currentIds = JSON.parse(shot.audio_asset_ids_json || "[]") as string[];
-      const nextIds = currentIds.includes(String(clip.audio_asset_id)) ? currentIds : [...currentIds, String(clip.audio_asset_id)];
-      db.prepare("UPDATE shots SET audio_asset_ids_json=?,audio_mode='dialogue_lipsync',updated_at=? WHERE id=?").run(JSON.stringify(nextIds), now(), shot.id);
     }
-    db.prepare("UPDATE audio_clips SET shot_id=?,status='approved',notes=?,updated_at=? WHERE id=?").run(shotId, "已试听确认并绑定镜头", now(), clipId);
+    db.prepare("UPDATE audio_clips SET shot_id=?,status='approved',notes=?,updated_at=? WHERE id=?").run(shotId, "历史精确台词素材已试听确认；不再作为Seedance声音完成条件", now(), clipId);
     emitEvent("project.updated", { projectId });
-    return { ok: true, shotId, audioAssetId: String(clip.audio_asset_id) };
+    return { ok: true, shotId, audioAssetId: String(clip.audio_asset_id), historicalOnly: true };
   });
 
   app.post("/api/shots/:shotId/codex-image-requests", async (request, reply) => {
@@ -641,6 +721,21 @@ export async function registerRoutes(app: FastifyInstance) {
     });
     emitEvent("project.updated", { projectId: current.projectId });
     return value;
+  });
+
+  app.post("/api/shots/:shotId/image-revision", async (request, reply) => {
+    const { shotId } = request.params as { shotId: string };
+    const body = z.object({ feedback: z.string().trim().min(1, "退回首帧时必须填写具体修改意见。") }).parse(request.body);
+    const shot = db.prepare("SELECT id,project_id,approved_image_media_id FROM shots WHERE id=?").get(shotId) as { id: string; project_id: string; approved_image_media_id: string | null } | undefined;
+    if (!shot) throw new Error("分镜不存在。");
+    const stage = store.getProject(shot.project_id).stage;
+    if (!["storyboard_design", "storyboard_user_review", "sample_image", "sample_video", "batch_generation"].includes(stage)) throw new Error("当前阶段不能退回分镜首帧；请先从对应审核阶段退回制作阶段。");
+    const revision = store.addRevision(shot.project_id, { targetType: "image", targetId: shotId, category: "镜头首帧退回", feedback: body.feedback });
+    const affectedShots = shot.approved_image_media_id
+      ? invalidateShotCascade(shot.project_id, [shotId], true)
+      : (db.prepare("UPDATE shots SET status='stale',updated_at=? WHERE id=?").run(now(), shotId), [{ id: shotId, downstream: false }]);
+    emitEvent("project.updated", { projectId: shot.project_id });
+    return reply.code(201).send({ revision, affectedShots });
   });
 
   app.post("/api/shots/:shotId/lock-image", async (request) => {
@@ -689,7 +784,7 @@ export async function registerRoutes(app: FastifyInstance) {
       if (!lastFrame) throw new Error("视频已完成，但无法取得尾帧。请检查本机 FFmpeg 后重试通过操作。");
       const observedEndState = body.observedEndState.trim() || shot.planned_end_state;
       if (!observedEndState) throw new Error("请填写该视频真实结束时的可见状态，连续镜头需要据此承接。");
-      const observedAudioState = body.observedAudioState.trim() || (shot.audio_mode === "silent" ? "无声视频，声音留待后期" : shot.audio_direction || "用户确认本镜头声音与口型可用");
+      const observedAudioState = body.observedAudioState.trim() || (shot.audio_mode === "silent" ? "剧情本身无声" : shot.audio_direction || "用户确认本镜头声音与口型可用");
       db.prepare("UPDATE shots SET approved_video_job_id=?,observed_end_state=?,observed_audio_state=?,last_frame_media_id=?,sample_approved=1,updated_at=? WHERE id=?").run(job.id, observedEndState, observedAudioState, lastFrame.id, now(), shotId);
       store.resolveOpenRevisions(shot.project_id, "video", shotId);
       if (store.getProject(shot.project_id).stage === "sample_video") store.setStage(shot.project_id, "batch_generation");
@@ -778,7 +873,6 @@ export async function registerRoutes(app: FastifyInstance) {
         const parent = db.prepare("SELECT approved_video_job_id,observed_end_state,last_frame_media_id FROM shots WHERE id=?").get(String(shot.parent_shot_id)) as { approved_video_job_id: string | null; observed_end_state: string; last_frame_media_id: string | null } | undefined;
         if (!parent?.approved_video_job_id || !parent.observed_end_state || !parent.last_frame_media_id) throw new Error("上一镜头尚未通过视频审核并记录尾帧，当前连续镜头不能生成。");
       }
-      const audioIds = JSON.parse(String(shot.audio_asset_ids_json ?? "[]")) as string[];
       const videoReferenceIds = JSON.parse(String(shot.video_reference_media_ids_json ?? "[]")) as string[];
       if (videoReferenceIds.length > 3) throw new Error("每个镜头最多绑定3段视频参考。");
       const videoReferences = videoReferenceIds.length ? db.prepare(`SELECT id,source_url,expires_at,kind FROM media_files WHERE project_id=? AND id IN (${videoReferenceIds.map(() => "?").join(",")})`).all(projectId, ...videoReferenceIds) as { id: string; source_url: string; expires_at: string | null; kind: string }[] : [];
@@ -788,27 +882,41 @@ export async function registerRoutes(app: FastifyInstance) {
       const assetIds = JSON.parse(String(shot.asset_ids_json ?? "[]")) as string[];
       if (assetIds.length + (shot.approved_image_media_id ? 1 : 0) > 9) throw new Error("每个镜头最多提交9张图片参考（包含锁定首帧）。");
       body.params.image_reference_asset_ids = assetIds;
-      if (audioIds.length > 3) throw new Error("Seedance 2.0 每个镜头最多绑定 3 个音频参考。");
-      const audioAssets = audioIds.length ? db.prepare(`SELECT id,remote_url FROM audio_assets WHERE project_id=? AND id IN (${audioIds.map(() => "?").join(",")})`).all(projectId, ...audioIds) as { id: string; remote_url: string }[] : [];
-      const audioDuration = audioIds.length ? db.prepare(`SELECT COALESCE(SUM(duration),0) AS total FROM audio_assets WHERE project_id=? AND id IN (${audioIds.map(() => "?").join(",")})`).get(projectId, ...audioIds) as { total: number } : { total: 0 };
-      if (audioIds.length && audioAssets.length !== audioIds.length) throw new Error("镜头绑定的声音资产已不存在，请重新选择。");
-      if (audioIds.length && audioAssets.some((item) => !item.remote_url)) throw new Error("镜头使用了声音参考，但部分声音资产没有 APIMart 可访问的 HTTPS URL。请先补充远程地址。");
-      if (Number(audioDuration.total) > 15) throw new Error("该镜头绑定的参考音频总时长超过 15 秒。请为当前镜头切分更短的台词或音乐片段。");
-      if (shot.audio_mode === "silent") body.params.generate_audio = false;
-      else if (shot.audio_mode !== "generated") {
-        if (!audioAssets.length) throw new Error("当前音频模式需要至少绑定一个声音资产。");
-        body.params.audio_urls = audioAssets.map((item) => item.remote_url);
-        body.params.audio_reference_mode = String(shot.audio_mode);
+      const dashboard = store.dashboard(projectId);
+      const typedShot = dashboard.shots.find((item) => item.id === body.shotId)!;
+      const dialogueLines = parseShotDialogue(typedShot.dialogue, typedShot.speakerMap);
+      delete body.params.audio_urls;
+      if (dialogueLines.length) {
+        if (typedShot.audioMode !== "voice_reference") throw new Error("含对白镜头必须使用“角色音色参考”，不能使用成品台词、模型自由音色或无声模式。");
+        const voice = resolveShotVoiceReferences(typedShot, dashboard.audioAssets);
+        if (voice.errors.length) throw new Error(`当前镜头不能生成视频：${voice.errors.join("；")}。`);
+        body.prompt = voice.prompt;
+        body.params.audio_urls = voice.audioUrls;
+        body.params.audio_reference_mode = "voice_reference";
+        body.params.voice_anchor_snapshot = voiceSnapshot(voice.resolved);
         body.params.generate_audio = true;
+      } else if (typedShot.audioMode === "dialogue_lipsync") {
+        throw new Error("成品台词驱动口型只保留历史兼容，新增视频请改用角色音色参考。");
+      } else if (typedShot.audioMode === "music_sync") {
+        const audioIds = typedShot.audioAssetIds;
+        if (!audioIds.length) throw new Error("MV音乐节拍模式必须绑定一个音乐片段。");
+        if (audioIds.length > 3) throw new Error("Seedance 2.0 每个镜头最多绑定3个音频参考。");
+        const music = dashboard.audioAssets.filter((audio) => audioIds.includes(audio.id));
+        if (music.length !== audioIds.length || music.some((audio) => audio.type !== "music")) throw new Error("MV镜头绑定的音乐资产不存在或类型不正确。");
+        if (music.some((audio) => !/^(?:https:\/\/|asset:\/\/)/i.test(audio.remoteUrl))) throw new Error("MV音乐片段缺少Seedance可访问的地址。");
+        if (music.reduce((sum, audio) => sum + audio.duration, 0) > 15) throw new Error("MV音乐参考总时长超过15秒。");
+        body.params.audio_urls = music.map((audio) => audio.remoteUrl);
+        body.params.audio_reference_mode = "music_sync";
+        body.params.generate_audio = true;
+      } else if (typedShot.audioMode === "voice_reference") {
+        throw new Error("当前镜头没有可识别对白，不需要角色音色参考；请改为模型生成声音或剧情本身无声。");
+      } else {
+        body.params.generate_audio = typedShot.audioMode !== "silent";
       }
-      const audioTypes = audioIds.length ? db.prepare(`SELECT type FROM audio_assets WHERE project_id=? AND id IN (${audioIds.map(() => "?").join(",")})`).all(projectId, ...audioIds) as { type: string }[] : [];
-      if (shot.audio_mode === "voice_reference" && !audioTypes.some((item) => item.type === "character_voice")) throw new Error("角色音色参考模式必须绑定至少一个“角色音色”资产。");
-      if (shot.audio_mode === "dialogue_lipsync" && !audioTypes.some((item) => item.type === "dialogue_line")) throw new Error("成品台词口型模式必须绑定至少一个“成品台词”资产。");
-      if (shot.audio_mode === "music_sync" && !audioTypes.some((item) => item.type === "music")) throw new Error("MV音乐节拍模式必须绑定至少一个“音乐片段”资产。");
       body.params = { ...body.params, return_last_frame: true, first_frame_media_id: shot.approved_image_media_id ? String(shot.approved_image_media_id) : "" };
       if (shot.sequence_relation === "seamless_continuation" && shot.parent_shot_id) body.params.continuity_parent_shot_id = String(shot.parent_shot_id);
     }
-    const job = store.addJob({ projectId, shotId: body.shotId ?? null, assetId: body.assetId ?? null, kind: body.kind,
+    const job = store.addJob({ projectId, shotId: body.shotId ?? null, assetId: body.assetId ?? null, audioAssetId: null, kind: body.kind,
       provider: body.provider, model: body.model, prompt: body.prompt, params: body.params });
     if (body.kind === "image" && body.assetId) {
       db.prepare("UPDATE assets SET status=CASE WHEN status='draft' THEN 'draft' ELSE 'stale' END,approved_job_id=NULL,updated_at=? WHERE id=?").run(now(), body.assetId);
@@ -870,11 +978,12 @@ export async function registerRoutes(app: FastifyInstance) {
     const resolved = path.resolve(filePath);
     const dataRoot = path.resolve(path.dirname(store.getSetting("data_root") ?? path.join(process.cwd(), ".data", "placeholder")));
     const safeRoot = path.resolve(process.cwd(), ".data");
+    const deliverySafeRoot = path.resolve(deliveryRoot);
     const isWithin = (root: string) => {
       const relative = path.relative(root, resolved);
       return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
     };
-    if (!isWithin(safeRoot) && !isWithin(dataRoot)) return reply.code(403).send({ error: "禁止访问工作台数据目录之外的文件。" });
+    if (!isWithin(safeRoot) && !isWithin(dataRoot) && !isWithin(deliverySafeRoot)) return reply.code(403).send({ error: "禁止访问工作台数据目录之外的文件。" });
     if (!fs.existsSync(resolved)) return reply.code(404).send({ error: "文件不存在。" });
     const ext = path.extname(resolved).toLowerCase();
     const mime = ext === ".mp4" ? "video/mp4" : ext === ".png" ? "image/png" : ext === ".jpg" || ext === ".jpeg" ? "image/jpeg" : ext === ".webp" ? "image/webp" : ext === ".svg" ? "image/svg+xml" : "application/octet-stream";
@@ -888,10 +997,13 @@ export async function registerRoutes(app: FastifyInstance) {
     imageResolution: store.getSetting("image_resolution") ?? "2k",
     videoModel: store.getSetting("video_model") ?? "doubao-seedance-2.0",
     defaultProvider: store.getSetting("default_provider") ?? "mock"
-    ,audioModel: store.getSetting("audio_model") ?? "seed-audio-1.0"
+    ,audioModel: store.getSetting("audio_model") ?? "seed-audio-1.0",
+    jianying: getJianyingConfig()
   }));
   app.put("/api/settings", async (request) => {
-    const body = z.object({ apiKey: z.string().optional(), volcengineAudioApiKey: z.string().optional(), imageModel: z.string().optional(), imageResolution: z.string().optional(), videoModel: z.string().optional(), audioModel: z.literal("seed-audio-1.0").optional(), defaultProvider: z.enum(["apimart", "mock"]).optional() }).parse(request.body);
+    const body = z.object({ apiKey: z.string().optional(), volcengineAudioApiKey: z.string().optional(), imageModel: z.string().optional(), imageResolution: z.string().optional(), videoModel: z.string().optional(), audioModel: z.literal("seed-audio-1.0").optional(), defaultProvider: z.enum(["apimart", "mock"]).optional(),
+      jianying: z.object({ enabled: z.boolean().optional(), executable: z.string().optional(), adapter: z.string().optional(), projectRoot: z.string().optional(), timeoutSeconds: z.number().int().min(1).max(86400).optional(), commandTemplates: z.record(z.string(), z.array(z.string())).optional() }).optional()
+    }).parse(request.body);
     if (body.apiKey) store.setSetting("apimart_api_key", encryptSecret(body.apiKey.trim()));
     if (body.volcengineAudioApiKey) store.setSetting("volcengine_audio_api_key", encryptSecret(body.volcengineAudioApiKey.trim()));
     if (body.imageModel) {
@@ -907,7 +1019,8 @@ export async function registerRoutes(app: FastifyInstance) {
     }
     if (body.audioModel) store.setSetting("audio_model", body.audioModel);
     if (body.defaultProvider) store.setSetting("default_provider", body.defaultProvider);
-    return { ok: true };
+    if (body.jianying) saveJianyingConfig(body.jianying);
+    return { ok: true, jianying: getJianyingConfig() };
   });
   app.post("/api/settings/test", async (request) => {
     const body = z.object({ provider: z.enum(["apimart", "mock", "volcengine_audio"]), apiKey: z.string().optional() }).parse(request.body);

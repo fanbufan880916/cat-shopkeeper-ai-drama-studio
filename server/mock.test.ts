@@ -5,7 +5,7 @@ import { MockProvider } from "./providers/mock.js";
 
 function job(kind: "image" | "video", params: Record<string, unknown> = {}): GenerationJob {
   const old = new Date(Date.now() - 2000).toISOString();
-  return { id: `test-${kind}-${Date.now()}`, projectId: "project", shotId: "shot", assetId: null, kind, provider: "mock", model: "mock",
+  return { id: `test-${kind}-${Date.now()}`, projectId: "project", shotId: "shot", assetId: null, audioAssetId: null, kind, provider: "mock", model: "mock",
     prompt: "测试生成结果", params, externalTaskId: "mock", status: "processing", progress: 50, cost: 0, creditsCost: 0,
     output: {}, error: "", attempt: 1, nextPollAt: null, createdAt: old, updatedAt: old };
 }

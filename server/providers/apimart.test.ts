@@ -11,7 +11,7 @@ function job(patch: Partial<GenerationJob> = {}): GenerationJob {
     id: "job_test", projectId: "prj_test", shotId: null, assetId: null, kind: "image", provider: "apimart",
     model: "gpt-image-2-official", prompt: "test", params: {}, externalTaskId: null, status: "draft",
     progress: 0, cost: 0, creditsCost: 0, output: {}, error: "", attempt: 0, nextPollAt: null,
-    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), ...patch
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), ...patch, audioAssetId: patch.audioAssetId ?? null
   };
 }
 
@@ -56,6 +56,24 @@ describe("APIMartProvider", () => {
       image_with_roles: [{ url: "https://example.com/first.png", role: "first_frame" }]
     } }), "sk-test");
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({ return_last_frame: true, image_with_roles: [{ url: "https://example.com/first.png", role: "first_frame" }] });
+  });
+
+  it("submits private Seedance audio with the documented endpoint and payload", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({ code: 200, data: { task_id: "task_voice" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await new APIMartProvider().submit(job({
+      kind: "audio_registration", model: "seedance-private-audio", audioAssetId: "aud_voice",
+      params: { project_name: "洗鞋的温度", asset_type: "Audio", url: "https://example.com/xiaoman.wav", name: "小曼音色" }
+    }), "sk-test");
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.apimart.ai/v1/seedance2/private-avatar");
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ project_name: "洗鞋的温度", asset_type: "Audio", url: "https://example.com/xiaoman.wav" });
+  });
+
+  it("treats a returned asset URL as a completed private audio registration", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({ code: 200, data: { status: "processing", result: { usable_assets: [{ asset_url: "asset://voice/xiaoman" }] } } })));
+    const result = await new APIMartProvider().poll(job({ kind: "audio_registration", externalTaskId: "task_voice", status: "processing" }), "sk-test");
+    expect(result.status).toBe("completed");
+    expect(result.output).toEqual({ usable_assets: [{ asset_url: "asset://voice/xiaoman" }] });
   });
 
   it("maps completed task results for local persistence", async () => {

@@ -3,8 +3,8 @@
     "version":  "1.0.0",
     "source":  "Project role contracts + cited open-source production workflows",
     "commitHash":  "",
-    "checksum":  "c390e2a64b3276242a6b52729523173fde4696d7cacee7448a888e341f900cb7",
+    "checksum":  "31fdc33296ceca1cb01b6d76cc6281eaff3ea5c34a9cdf78d52e02d1d0cfa030",
     "valid":  true,
     "details":  "Skill structure, 14 model-agnostic Agent contracts, WORKFLOW tool names and MCP registry passed.",
-    "updatedAt":  "2026-07-16T12:14:12.5327634Z"
+    "updatedAt":  "2026-07-17T14:42:46.8336576Z"
 }

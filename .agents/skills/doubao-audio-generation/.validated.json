@@ -3,8 +3,8 @@
     "version":  "1.0.0",
     "source":  "Volcengine Doubao official prompt patterns",
     "commitHash":  "",
-    "checksum":  "e72b27946b8a84373a8c5278b74182510ce28167e425e081b3ed5df49e6eb287",
+    "checksum":  "757ad66b67029228dc7d9d53074a1303d6a64a2f76a835121fbd0afc67a78a83",
     "valid":  true,
     "details":  "Skill structure and positive/negative audio prompt lint regression tests passed.",
-    "updatedAt":  "2026-07-16T12:14:10.5884063Z"
+    "updatedAt":  "2026-07-17T14:42:43.7874302Z"
 }

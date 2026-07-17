@@ -98,6 +98,25 @@ export async function attachLocalReferences(job: ReturnType<typeof store.getJob>
   return { ...job, params };
 }
 
+async function finalizeCompletedOutput(job: ReturnType<typeof store.getJob>, output: unknown) {
+  if (job.kind === "audio_registration") {
+    const usable = (output as { usable_assets?: Array<{ asset_url?: string }> } | undefined)?.usable_assets ?? [];
+    const assetUrl = usable.map((item) => String(item.asset_url ?? "")).find((url) => url.startsWith("asset://"));
+    if (!assetUrl) throw new Error("Seedance音色审核任务已结束，但没有返回可用的 asset:// 素材地址。");
+    if (!job.audioAssetId) throw new Error("Seedance音色审核任务缺少对应的声音资产。");
+    db.prepare("UPDATE audio_assets SET seedance_asset_url=?,registration_job_id=?,updated_at=? WHERE id=?").run(assetUrl, job.id, new Date().toISOString(), job.audioAssetId);
+    return output;
+  }
+  const persisted = await persistRemoteOutputs(job.projectId, job.id, job.kind, output);
+  if (job.kind === "audio" && job.audioAssetId) {
+    const result = persisted as { localPaths?: string[]; audioUrl?: string; original_duration?: number; duration?: number };
+    const media = db.prepare("SELECT expires_at FROM media_files WHERE job_id=? AND kind='audio' ORDER BY created_at DESC LIMIT 1").get(job.id) as { expires_at: string | null } | undefined;
+    if (result.localPaths?.[0]) db.prepare("UPDATE audio_assets SET local_path=?,remote_url=?,duration=?,source_job_id=?,source_expires_at=?,updated_at=? WHERE id=?").run(
+      result.localPaths[0], result.audioUrl ?? "", Number(result.original_duration ?? result.duration ?? 0), job.id, media?.expires_at ?? null, new Date().toISOString(), job.audioAssetId);
+  }
+  return persisted;
+}
+
 export async function processJobs() {
   if (running) return;
   running = true;
@@ -112,22 +131,15 @@ export async function processJobs() {
           const submittedJob = job.provider === "apimart" ? await attachLocalReferences(job, provider, apiKey) : job;
           if (submittedJob !== job) store.updateJob(job.id, { params: submittedJob.params });
           const submitted = await provider.submit(submittedJob, apiKey);
-          let output = submitted.output ?? {};
-          if (submitted.status === "completed") output = await persistRemoteOutputs(job.projectId, job.id, job.kind, output);
+          let output: unknown = submitted.output ?? {};
+          if (submitted.status === "completed") output = await finalizeCompletedOutput(submittedJob, output);
           store.updateJob(job.id, { params: submittedJob.params, externalTaskId: submitted.taskId, status: submitted.status === "completed" ? "completed" : "submitted", progress: submitted.status === "completed" ? 100 : 0, output, attempt: job.attempt + 1, nextPollAt: submitted.status === "completed" ? null : nextPoll(job.attempt) });
-          if (submitted.status === "completed" && job.kind === "audio") {
-            const result = output as { localPaths?: string[]; audioUrl?: string; original_duration?: number; duration?: number };
-            const audioAssetId = String((submittedJob.params as Record<string, unknown>).audioAssetId ?? "");
-            if (audioAssetId && result.localPaths?.[0]) {
-              db.prepare("UPDATE audio_assets SET local_path=?,remote_url=?,duration=?,updated_at=? WHERE id=?").run(result.localPaths[0], result.audioUrl ?? "", Number(result.original_duration ?? result.duration ?? 0), new Date().toISOString(), audioAssetId);
-            }
-          }
           emitEvent("job.updated", { projectId: job.projectId, jobId: job.id });
           continue;
         }
         const result = await provider.poll(job, apiKeyFor(job.provider));
-        let output = result.output ?? {};
-        if (result.status === "completed") output = await persistRemoteOutputs(job.projectId, job.id, job.kind, output);
+        let output: unknown = result.output ?? {};
+        if (result.status === "completed") output = await finalizeCompletedOutput(job, output);
         store.updateJob(job.id, { status: result.status, progress: result.progress, cost: result.cost ?? job.cost,
           creditsCost: result.creditsCost ?? job.creditsCost, output, error: result.error ?? "", attempt: job.attempt + 1,
           nextPollAt: result.status === "submitted" || result.status === "processing" ? nextPoll(job.attempt) : null });

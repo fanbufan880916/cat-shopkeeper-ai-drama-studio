@@ -9,6 +9,9 @@ import { assertArtifactWriteAllowed, assertGateAllowed, assertShotWriteAllowed, 
 import { mediaDir } from "./paths.js";
 import { refreshSkillStatus } from "./skills.js";
 import { asJson, id, now } from "./utils.js";
+import { saveJianyingConfig, getJianyingConfig, checkJianyingCli } from "./jianying.js";
+import { prepareEditManifest, runEdit, getEditStatus, inspectEditOutput, approveFinalEdit, rejectFinalEdit, cancelEdit } from "./editing.js";
+import { inferShotVoiceBindings } from "../shared/voice-anchors.js";
 
 const server = new McpServer({ name: "cat-studio", version: "0.1.0" });
 const result = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }], structuredContent: value as Record<string, unknown> });
@@ -55,6 +58,60 @@ server.registerTool("get_project_context", {
   description: "读取项目全部上下文，包括当前阶段、剧本版本、审核、资产、分镜、生成任务和退回项。",
   inputSchema: { projectId: z.string() }
 }, async ({ projectId }) => result(store.dashboard(projectId)));
+
+server.registerTool("configure_jianying", {
+  description: "配置本地剪映 CLI 和适配器。真实剪映命令参数放在 commandTemplates 中，模板是字符串数组，可使用 {executable}、{projectRoot}、{manifest}、{output}、{operation} 占位符。",
+  inputSchema: {
+    enabled: z.boolean().optional(), executable: z.string().optional(), adapter: z.string().optional(), projectRoot: z.string().optional(), timeoutSeconds: z.number().int().min(1).max(86400).optional(),
+    commandTemplates: z.record(z.string(), z.array(z.string())).optional()
+  }
+}, async (input) => result(saveJianyingConfig(input)));
+
+server.registerTool("prepare_edit_manifest", {
+  description: "根据最新剧本、分镜和已通过视频生成 edit-plan-vXX.md 与 edit-manifest-vXX.json，不导出成片。",
+  inputSchema: { projectId: z.string() }
+}, async ({ projectId }) => result(prepareEditManifest(projectId)));
+
+server.registerTool("check_jianying_cli", {
+  description: "检查剪映 CLI 路径、适配器和可执行性；失败时返回真实原因，不会改用其他生产剪辑工具。",
+  inputSchema: {}
+}, async () => result({ config: getJianyingConfig(), check: await checkJianyingCli() }));
+
+server.registerTool("run_jianying_edit", {
+  description: "按指定剪辑清单调用本地剪映 CLI 导出版本化成片。必须显式确认；导出失败或技术质检失败会停在剪辑阶段。",
+  inputSchema: { editJobId: z.string(), confirm: z.boolean().default(false) }
+}, async ({ editJobId, confirm }) => {
+  if (!confirm) throw new Error("请先明确确认调用剪映 CLI 导出，例如：确认导出这个剪辑任务。");
+  return result(await runEdit(editJobId));
+});
+
+server.registerTool("get_jianying_edit_status", {
+  description: "查询剪映剪辑任务状态、版本、命令输出、错误和最终审核状态。",
+  inputSchema: { editJobId: z.string() }
+}, async ({ editJobId }) => result(getEditStatus(editJobId)));
+
+server.registerTool("inspect_edit_output", {
+  description: "使用 FFmpeg/FFprobe 检查剪映成片的文件、分辨率、9:16 画幅、时长、音轨、字幕安全区和文件大小。技术质检不等于人工批准。",
+  inputSchema: { editJobId: z.string() }
+}, async ({ editJobId }) => result(await inspectEditOutput(editJobId)));
+
+server.registerTool("approve_final_edit", {
+  description: "记录用户确认的最终成片审核并完成项目。Codex 不会自动调用或自动批准此操作。",
+  inputSchema: { editJobId: z.string(), confirm: z.boolean().default(false), scores: z.record(z.string(), z.number().min(1).max(5)).default({ technical: 5, content: 5 }), feedback: z.string().default("") }
+}, async ({ editJobId, confirm, scores, feedback }) => {
+  if (!confirm) throw new Error("必须先得到用户明确确认，才能批准最终成片。");
+  return result(approveFinalEdit(editJobId, scores, feedback));
+});
+
+server.registerTool("reject_final_edit", {
+  description: "记录用户退回的最终成片，并保留旧版本；下一版只应修改受影响的镜头、声音、字幕或剪辑参数。",
+  inputSchema: { editJobId: z.string(), feedback: z.string().min(1), affectedShotIds: z.array(z.string()).default([]) }
+}, async ({ editJobId, feedback, affectedShotIds }) => result(rejectFinalEdit(editJobId, feedback, affectedShotIds)));
+
+server.registerTool("cancel_jianying_edit", {
+  description: "取消尚未完成的剪映剪辑任务。已经导出的版本不会被删除或覆盖。",
+  inputSchema: { editJobId: z.string() }
+}, async ({ editJobId }) => result(cancelEdit(editJobId)));
 
 server.registerTool("save_artifact_version", {
   description: "保存创意、剧本、审核报告、资产方案或分镜的新版本。通过版本不能覆盖。",
@@ -108,7 +165,7 @@ server.registerTool("upsert_asset", {
 });
 
 server.registerTool("upsert_shot", {
-  description: "新增或修改分镜。视频时长应为4到15秒，最终图片和视频提示词必须分别经过项目 Skills。",
+  description: "新增或修改分镜。对白必须在voiceBindings中按首次出现顺序绑定说话人与角色资产；超过3个说话角色可以保存草稿但不能通过分镜审核。视频时长应为4到15秒，最终图片和视频提示词必须分别经过项目 Skills。",
   inputSchema: { projectId: z.string(), id: z.string().optional(), shotNumber: z.number().int().positive(), title: z.string(), duration: z.number().min(4).max(15),
     narrativePurpose: z.string(), composition: z.string(), camera: z.string(), action: z.string(), dialogue: z.string().default(""),
     imagePrompt: z.string(), videoPrompt: z.string(), assetIds: z.array(z.string()), sceneId: z.string().default("scene-01"), parentShotId: z.string().nullable().default(null),
@@ -116,11 +173,16 @@ server.registerTool("upsert_shot", {
     feltIntent: z.string().default(""), plannedStartState: z.string().default(""), plannedEndState: z.string().default(""),
     alreadyHappened: z.string().default(""), reservedForLater: z.string().default(""), continuityLocks: z.string().default(""),
     allowedChanges: z.string().default(""), audioMode: z.enum(["generated", "voice_reference", "dialogue_lipsync", "music_sync", "silent"]).default("generated"),
-    audioAssetIds: z.array(z.string()).max(3).default([]), speakerMap: z.string().default(""), audioDirection: z.string().default(""),
+    audioAssetIds: z.array(z.string()).max(3).default([]), voiceBindings: z.array(z.object({ speaker: z.string(), characterAssetId: z.string() })).optional(),
+    speakerMap: z.string().default(""), audioDirection: z.string().default(""),
     lipSyncNotes: z.string().default(""), observedEndState: z.string().default("") }
 }, async ({ projectId, ...input }) => {
   assertShotWriteAllowed(store.getProject(projectId).stage);
-  const shot = store.upsertShot(projectId, input);
+  const dashboard = store.dashboard(projectId);
+  const existing = input.id ? dashboard.shots.find((shot) => shot.id === input.id) : undefined;
+  const voiceBindings = input.voiceBindings ?? inferShotVoiceBindings(input.dialogue, input.speakerMap, dashboard.assets, existing?.voiceBindings ?? []);
+  const audioMode = input.dialogue.trim() && !existing?.approvedVideoJobId && ["generated", "silent", "dialogue_lipsync"].includes(input.audioMode) ? "voice_reference" : input.audioMode;
+  const shot = store.upsertShot(projectId, { ...input, audioMode, voiceBindings });
   emitEvent("project.updated", { projectId });
   return result(shot);
 });

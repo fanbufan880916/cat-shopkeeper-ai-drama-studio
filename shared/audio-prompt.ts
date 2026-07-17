@@ -261,6 +261,35 @@ export function buildHongKongAudioPrompt(lines: AudioPromptLine[]) {
   return buildAudioPrompt(lines, { style: "hk90" });
 }
 
+/** Build a short, dry, single-character sample used only as a Seedance voice identity anchor. */
+export function buildVoiceAnchorPrompt(line: AudioPromptLine, options: AudioPromptOptions = {}) {
+  const context = options.script === undefined ? null : audioPromptContextFromScript(options.script);
+  const style = options.style ?? context?.style ?? "modern_realistic";
+  const characters = options.characters ?? context?.characters ?? [];
+  const speaker = line.speaker.trim();
+  const character = characterForSpeaker(speaker, characters);
+  const identity = voiceAnchor(speaker, style, line, characters);
+  const performance = performanceDirection(line, style, character);
+  return `${identity}。\n这是4到5秒的单角色干声音色样本：无音乐、无环境声、无音效、无混响，不模仿任何具体演员。\n${performance}：“${line.text.trim()}”`;
+}
+
+export function validateVoiceAnchorPrompt(prompt: string, style: AudioStyleProfile | "auto" = "auto") {
+  const errors: string[] = [];
+  const text = prompt.trim();
+  if (!text) errors.push("音色锚点提示词不能为空。");
+  if (!/(?:是|为).*(?:男|女|声线|音色|普通话|粤语|英语|方言|口音|拟人)/.test(text)) errors.push("缺少角色年龄、性别、声线、语言或口音依据。");
+  if (!/4到5秒|4～5秒|4-5秒/.test(text)) errors.push("音色锚点必须明确为4到5秒。");
+  if (!/单角色/.test(text)) errors.push("音色锚点必须是单角色样本。");
+  if (!/无音乐/.test(text) || !/无环境声/.test(text) || !/无音效/.test(text)) errors.push("音色锚点必须明确无音乐、无环境声、无音效。");
+  if (!/[“\"‘'].+[”\"’']/.test(text)) errors.push("音色锚点必须包含一条短测试台词。");
+  if (!/(停顿|语速|音量|声线|尾音|情绪|咬字|低声|高声|加快|放慢)/.test(text)) errors.push("缺少具体表演方式。");
+  if (/年龄和性别尚未从锁定剧本确认|暂不允许提交真实生成/.test(text)) errors.push("角色年龄或性别没有锁定剧本依据。");
+  if (style === "needs_review") errors.push("锁定剧本没有明确声音风格，不能生成音色锚点。");
+  if (style !== "hk90" && style !== "auto" && /(?:使用|采用|人物说|角色说|用)港式普通话/.test(text) && !rejectsHongKongMandarin(text)) errors.push("当前剧本没有港式普通话依据，不能提交港式口音。");
+  if (/(模仿.*周星驰|模仿.*刘德华|模仿.*梁朝伟|复制.*演员|电影原声)/.test(text)) errors.push("不能要求复制具体演员或电影原声。");
+  return errors;
+}
+
 /** Validate the official plain-text structure before a paid generation request. */
 export function validateAudioPrompt(prompt: string, style: AudioStyleProfile | "auto" = "auto") {
   const errors: string[] = [];

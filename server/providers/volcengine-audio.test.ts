@@ -9,7 +9,7 @@ describe("VolcengineAudioProvider", () => {
       produce_id: "produce-1", audio: Buffer.from("RIFF").toString("base64"), original_duration: 2.4, format: "wav"
     } }), { status: 200 }));
     const provider = new VolcengineAudioProvider();
-    const result = await provider.submit({ id: "job-1", projectId: "p", shotId: null, assetId: null, kind: "audio", provider: "volcengine", model: "seed-audio-1.0", prompt: "猫掌柜用沉稳普通话说：鞋可以带走。", params: {
+    const result = await provider.submit({ id: "job-1", projectId: "p", shotId: null, assetId: null, audioAssetId: "aud-1", kind: "audio", provider: "volcengine", model: "seed-audio-1.0", prompt: "猫掌柜用沉稳普通话说：鞋可以带走。", params: {
       speaker: "S_demo", referenceAudioUrls: ["https://example.com/voice.mp3"], format: "wav", sampleRate: 24000, enableSubtitle: true, speechRate: 5, pitchRate: -1, loudnessRate: 0
     }, externalTaskId: null, status: "draft", progress: 0, cost: 0, creditsCost: 0, output: {}, error: "", attempt: 0, nextPollAt: null, createdAt: "", updatedAt: "" }, "secret");
     const [, init] = fetchMock.mock.calls[0];
@@ -22,4 +22,3 @@ describe("VolcengineAudioProvider", () => {
     expect(result).toMatchObject({ taskId: "produce-1", status: "completed" });
   });
 });
-

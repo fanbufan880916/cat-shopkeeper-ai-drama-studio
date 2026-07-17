@@ -14,7 +14,7 @@ function shot(patch: Partial<Shot>): Shot {
     camera: "", action: "", dialogue: "阿强：我的鞋还能救吗？", imagePrompt: "", videoPrompt: "", assetIds: [],
     sceneId: "scene-01", parentShotId: null, sequenceRelation: "sequence_first_clip", feltIntent: "", plannedStartState: "",
     plannedEndState: "", alreadyHappened: "", reservedForLater: "", continuityLocks: "", allowedChanges: "",
-    audioMode: "dialogue_lipsync", audioAssetIds: [], videoReferenceMediaIds: [], speakerMap: "", audioDirection: "",
+    audioMode: "dialogue_lipsync", audioAssetIds: [], voiceBindings: [], videoReferenceMediaIds: [], speakerMap: "", audioDirection: "",
     lipSyncNotes: "", status: "draft", sampleApproved: false, approvedImageJobId: null, approvedImageMediaId: null,
     approvedVideoJobId: null, observedEndState: "", observedAudioState: "", lastFrameMediaId: null, createdAt: "", updatedAt: "", ...patch
   };

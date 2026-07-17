@@ -1,10 +1,10 @@
-import type { Asset, CodexImageRequest, GenerationJob, Shot } from "../shared/types";
+import type { Asset, AudioAsset, CodexImageRequest, GenerationJob, Shot } from "../shared/types";
 
 const statusPriority: Record<string, number> = {
   processing: 0, failed: 1, submitted: 2, queued: 2, draft: 3, completed: 4, cancelled: 5
 };
 
-export function taskObject(job: Pick<GenerationJob, "assetId" | "shotId" | "id">, assets: Asset[], shots: Shot[]) {
+export function taskObject(job: Pick<GenerationJob, "assetId" | "shotId" | "id"> & { audioAssetId?: string | null }, assets: Asset[], shots: Shot[], audioAssets: AudioAsset[] = []) {
   if (job.assetId) {
     const asset = assets.find((item) => item.id === job.assetId);
     return {
@@ -23,11 +23,15 @@ export function taskObject(job: Pick<GenerationJob, "assetId" | "shotId" | "id">
       sourceId: shot ? job.shotId : null
     };
   }
+  if (job.audioAssetId) {
+    const audio = audioAssets.find((item) => item.id === job.audioAssetId);
+    return { label: audio?.name ?? "历史声音资产（已不存在）", detail: job.id, section: "audio" as const, sourceId: audio ? job.audioAssetId : null };
+  }
   return { label: "项目级任务", detail: job.id, section: "jobs" as const, sourceId: null };
 }
 
 export function codexTaskObject(request: CodexImageRequest, assets: Asset[], shots: Shot[]) {
-  return taskObject({ id: request.id, assetId: request.assetId, shotId: request.shotId }, assets, shots);
+  return taskObject({ id: request.id, assetId: request.assetId, audioAssetId: null, shotId: request.shotId }, assets, shots);
 }
 
 export function sortTasks<T extends { status: string; createdAt: string }>(tasks: T[]) {

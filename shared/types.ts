@@ -9,6 +9,8 @@
   "sample_image",
   "sample_video",
   "batch_generation",
+  "edit_prepare",
+  "edit_render",
   "final_review",
   "completed"
 ] as const;
@@ -18,12 +20,15 @@ export type ArtifactType = "idea" | "script" | "director_review" | "audience_rev
 export type ReviewGate = "director" | "audience" | "script_user" | "asset_user" | "storyboard_user" | "final_user";
 export type ReviewDecision = "approved" | "rejected";
 export type AssetType = "character" | "scene" | "prop" | "style";
-export type JobKind = "image" | "video" | "audio" | "preview";
+export type JobKind = "image" | "video" | "audio" | "audio_registration" | "preview" | "edit";
 export type JobStatus = "draft" | "submitted" | "processing" | "completed" | "failed" | "cancelled";
+export type EditStatus = "draft" | "queued" | "running" | "completed" | "failed" | "cancelled";
 export type CodexImageRequestStatus = "queued" | "processing" | "completed" | "failed" | "cancelled";
 export type ShotRelation = "sequence_first_clip" | "intentional_next_shot" | "seamless_continuation" | "reanchor_after_drift";
 export type AudioAssetType = "character_voice" | "dialogue_line" | "scene_master" | "music" | "ambience" | "sfx";
+export type AudioAssetStatus = "draft" | "locked" | "superseded";
 export type ShotAudioMode = "generated" | "voice_reference" | "dialogue_lipsync" | "music_sync" | "silent";
+export interface ShotVoiceBinding { speaker: string; characterAssetId: string; }
 export type AudioClipStatus = "draft" | "ready" | "approved" | "rejected";
 export type ContentMode = "short_film" | "ad" | "mv";
 export type VisualStyleStatus = "needs_review" | "locked";
@@ -124,6 +129,7 @@ export interface Shot {
   allowedChanges: string;
   audioMode: ShotAudioMode;
   audioAssetIds: string[];
+  voiceBindings: ShotVoiceBinding[];
   videoReferenceMediaIds: string[];
   speakerMap: string;
   audioDirection: string;
@@ -145,6 +151,7 @@ export interface GenerationJob {
   projectId: string;
   shotId: string | null;
   assetId: string | null;
+  audioAssetId: string | null;
   kind: JobKind;
   provider: "apimart" | "mock" | "codex" | "volcengine";
   model: string;
@@ -159,6 +166,55 @@ export interface GenerationJob {
   error: string;
   attempt: number;
   nextPollAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EditClip {
+  shotId: string;
+  videoPath: string;
+  startTime: number;
+  duration: number;
+  audioPath: string | null;
+  subtitle: string;
+  transition: string;
+}
+
+export interface EditManifest {
+  projectId: string;
+  version: number;
+  aspectRatio: string;
+  targetDuration: number;
+  subtitleSafeArea: "9:16-safe";
+  generatedAt: string;
+  clips: EditClip[];
+  music: { path: string; volume: number } | null;
+  output: { path: string; format: "mp4"; resolution: string };
+}
+
+export interface EditQualityReport {
+  ok: boolean;
+  checkedAt: string;
+  checks: Array<{ name: string; ok: boolean; detail: string }>;
+  metadata: { duration?: number; width?: number; height?: number; hasAudio?: boolean; sizeBytes?: number };
+}
+
+export interface EditJob {
+  id: string;
+  projectId: string;
+  status: EditStatus;
+  adapter: string;
+  cliPath: string;
+  manifestPath: string;
+  planPath: string;
+  projectRoot: string;
+  outputPath: string;
+  version: number;
+  commandOutput: string;
+  error: string;
+  qualityReport: EditQualityReport | null;
+  finalReviewStatus: "pending" | "approved" | "rejected" | null;
+  exportedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -186,6 +242,14 @@ export interface AudioAsset {
   duration: number;
   rightsNote: string;
   description: string;
+  status: AudioAssetStatus;
+  version: number;
+  sourceJobId: string | null;
+  sourceExpiresAt: string | null;
+  voiceProfileHash: string;
+  seedanceAssetUrl: string;
+  registrationJobId: string | null;
+  lockedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -245,6 +309,7 @@ export interface DashboardData {
   assets: Asset[];
   shots: Shot[];
   jobs: GenerationJob[];
+  editJobs: EditJob[];
   mediaFiles: MediaFile[];
   audioAssets: AudioAsset[];
   audioClips: AudioClip[];
@@ -264,6 +329,8 @@ export const stageLabels: Record<WorkflowStage, string> = {
   sample_image: "样片生图",
   sample_video: "样片视频",
   batch_generation: "批量生成",
+  edit_prepare: "剪辑准备",
+  edit_render: "剪辑导出",
   final_review: "成片审核",
   completed: "已完成"
 };

@@ -52,6 +52,18 @@ export function assertArtifactWriteAllowed(stage: WorkflowStage, type: ArtifactT
   }
 }
 
+export function assertEditPrepareAllowed(stage: WorkflowStage) {
+  if (!(["batch_generation", "edit_prepare"] as WorkflowStage[]).includes(stage)) {
+    throw new Error(`当前阶段“${stage}”不能生成剪辑清单。请先让全部镜头视频通过审核。`);
+  }
+}
+
+export function assertEditRenderAllowed(stage: WorkflowStage) {
+  if (!(["edit_prepare", "edit_render"] as WorkflowStage[]).includes(stage)) {
+    throw new Error(`当前阶段“${stage}”不能调用剪映导出。请先生成并确认剪辑清单。`);
+  }
+}
+
 export function assertShotWriteAllowed(stage: WorkflowStage) {
   const allowed: WorkflowStage[] = ["storyboard_design", "storyboard_user_review", "sample_image", "sample_video", "batch_generation"];
   if (!allowed.includes(stage)) throw new Error(`当前阶段“${stage}”不能新增或修改分镜。`);

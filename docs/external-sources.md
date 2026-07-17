@@ -1,6 +1,6 @@
 # 外部方法、官方规则与开源来源登记
 
-最后人工核实：2026-07-16。
+最后人工核实：2026-07-17。
 
 本项目不以 GitHub Star 数量代替质量判断。可进入生产工作流的方法，至少要回答四件事：来源和许可证是否清楚、是否仍在维护、是否有测试/评测/Schema 等质量证据、进入本项目后由什么回归测试兜底。
 
@@ -24,7 +24,7 @@
 | 本地 Skill | 权威来源 | 为什么不直接套 GitHub 提示词 | 本地验证 |
 | --- | --- | --- | --- |
 | `gpt-image-2-storyboard` | [OpenAI Image generation guide](https://developers.openai.com/api/docs/guides/image-generation)、[OpenAI prompting guide](https://developers.openai.com/cookbook/examples/multimodal/image_gen/image_gen_prompting_guide)、APIMart 官方接口文档 | 模型字段和编辑能力会变，民间仓库可能混入其他模型参数；接口正确性优先于社区热度 | Skill 结构检查、提示词正反例自测、角色设定图服务端硬门禁、TypeScript 回归测试 |
-| `doubao-audio-generation` | 火山引擎豆包控制台官方纯文本模板结构与当前接口行为 | 声音模板涉及实际模型能力、语言和版权边界，不应照搬演员模仿类社区提示词 | Skill 结构检查、纯文本提示词正反例、港片/普通项目风格分流、提交前服务端 lint |
+| `doubao-audio-generation` | 火山引擎豆包控制台官方纯文本模板结构、[APIMart Seedance视频接口](https://docs.apimart.ai/cn/api-reference/videos/doubao-seedance-2-0/generation)、[APIMart私有素材接口](https://docs.apimart.ai/cn/api-reference/videos/doubao-seedance-2-0/private-avatar) | 声音模板涉及实际模型能力、语言和版权边界，不应照搬演员模仿类社区提示词；接口明确限制音频数量、总时长和与图片参数的组合方式 | 音色锚点/历史母带两种lint、港片/普通项目分流、私有音频端点与payload测试、`asset://`轮询测试、视频任务音色快照测试 |
 | `creative-production-orchestration` | 本项目角色契约，加上下列成熟项目的方法交叉验证 | 编排必须贴合本工作台的阶段机、数据库和用户审核点，不能复制其他工作台的流程图 | 14 个 Agent 的 TOML/跨模型检查、MCP 工具注册表检查、WORKFLOW 契约检查 |
 
 ## 只吸收方法，不复制代码

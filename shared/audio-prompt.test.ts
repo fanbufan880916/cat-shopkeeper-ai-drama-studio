@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { audioPromptContextFromScript, buildAudioPrompt, inferAudioStyleProfile, validateAudioPrompt } from "./audio-prompt.js";
+import { audioPromptContextFromScript, buildAudioPrompt, buildVoiceAnchorPrompt, inferAudioStyleProfile, validateAudioPrompt, validateVoiceAnchorPrompt } from "./audio-prompt.js";
 
 describe("audio prompt style selection", () => {
   it("only selects Hong Kong style when the script says so", () => {
@@ -41,6 +41,22 @@ describe("audio prompt style selection", () => {
     expect(prompt).not.toContain("港式普通话");
     expect(prompt).not.toContain("旧母带");
     expect(validateAudioPrompt(prompt, context.style)).toEqual([]);
+  });
+
+  it("builds Xiaoman as a female high-school student with standard Mandarin voice anchor", () => {
+    const script = {
+      productionConstraint: "现代校园故事，全部台词保持标准普通话（不得改为港式普通话）。",
+      characters: [{ name: "小曼", role: "女主", traits: "17岁女高中生，清澈温柔", voiceDirection: "17岁女高中生，标准普通话，声线清澈柔和，音量偏轻，情绪细腻" }]
+    };
+    const context = audioPromptContextFromScript(script);
+    const prompt = buildVoiceAnchorPrompt({ speaker: "小曼", text: "你今天，不一样。" }, { script });
+    expect(prompt).toContain("17岁女高中生");
+    expect(prompt).toContain("标准普通话");
+    expect(prompt).toContain("4到5秒");
+    expect(prompt).toContain("无音乐、无环境声、无音效");
+    expect(prompt).not.toContain("男性");
+    expect(prompt).not.toContain("港式普通话");
+    expect(validateVoiceAnchorPrompt(prompt, context.style)).toEqual([]);
   });
 
   it("builds a non-Hong-Kong prompt without forcing Hong Kong Mandarin", () => {

@@ -1,11 +1,12 @@
 ﻿import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { ArtifactType, Asset, AudioAsset, AudioClip, CodexImageRequest, DashboardData, GenerationJob, MediaFile, Project, Review, Shot, WorkflowStage, ContentMode, VisualStyleProfile } from "../shared/types.js";
-import { dataDir, dbPath, previewDir } from "./paths.js";
+import type { ArtifactType, Asset, AudioAsset, AudioClip, CodexImageRequest, DashboardData, EditJob, EditQualityReport, EditStatus, GenerationJob, MediaFile, Project, Review, Shot, WorkflowStage, ContentMode, VisualStyleProfile } from "../shared/types.js";
+import { dataDir, dbPath, deliveryRoot, previewDir } from "./paths.js";
 import { asJson, id, now, parseJson } from "./utils.js";
 import { cleanIdentityAnchor, cleanImagePrompt, extractAssetReferenceCode } from "../shared/image-prompt.js";
 import { inferVisualStyleProfile } from "../shared/creative-profile.js";
+import { inferShotVoiceBindings } from "../shared/voice-anchors.js";
 
 fs.mkdirSync(dataDir, { recursive: true });
 export const db = new DatabaseSync(dbPath);
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS shots (
   already_happened TEXT NOT NULL DEFAULT '', reserved_for_later TEXT NOT NULL DEFAULT '',
   continuity_locks TEXT NOT NULL DEFAULT '', allowed_changes TEXT NOT NULL DEFAULT '',
   audio_mode TEXT NOT NULL DEFAULT 'generated', audio_asset_ids_json TEXT NOT NULL DEFAULT '[]', video_reference_media_ids_json TEXT NOT NULL DEFAULT '[]',
+  voice_bindings_json TEXT NOT NULL DEFAULT '[]',
   speaker_map TEXT NOT NULL DEFAULT '', audio_direction TEXT NOT NULL DEFAULT '', lip_sync_notes TEXT NOT NULL DEFAULT '',
   approved_image_job_id TEXT, approved_image_media_id TEXT, approved_video_job_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
   UNIQUE(project_id, shot_number)
@@ -61,11 +63,19 @@ CREATE TABLE IF NOT EXISTS prompt_versions (
 );
 CREATE TABLE IF NOT EXISTS generation_jobs (
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  shot_id TEXT, asset_id TEXT, kind TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+  shot_id TEXT, asset_id TEXT, audio_asset_id TEXT, kind TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
   prompt TEXT NOT NULL, params_json TEXT NOT NULL, external_task_id TEXT, status TEXT NOT NULL,
   progress INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0, credits_cost REAL NOT NULL DEFAULT 0,
   output_json TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT '', attempt INTEGER NOT NULL DEFAULT 0,
   next_poll_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS edit_jobs (
+  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  status TEXT NOT NULL, adapter TEXT NOT NULL, cli_path TEXT NOT NULL DEFAULT '',
+  manifest_path TEXT NOT NULL, plan_path TEXT NOT NULL, project_root TEXT NOT NULL DEFAULT '', output_path TEXT NOT NULL,
+  version INTEGER NOT NULL, command_output TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+  quality_report_json TEXT, final_review_status TEXT, exported_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  UNIQUE(project_id, version)
 );
 CREATE TABLE IF NOT EXISTS codex_image_requests (
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -87,7 +97,9 @@ CREATE TABLE IF NOT EXISTS audio_assets (
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   type TEXT NOT NULL, name TEXT NOT NULL, character_asset_id TEXT, local_path TEXT NOT NULL DEFAULT '',
   remote_url TEXT NOT NULL DEFAULT '', duration REAL NOT NULL DEFAULT 0, rights_note TEXT NOT NULL DEFAULT '',
-  description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  description TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'draft', version INTEGER NOT NULL DEFAULT 1,
+  source_job_id TEXT, source_expires_at TEXT, voice_profile_hash TEXT NOT NULL DEFAULT '', seedance_asset_url TEXT NOT NULL DEFAULT '',
+  registration_job_id TEXT, locked_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS audio_clips (
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -161,12 +173,48 @@ addShotColumn("allowed_changes", "TEXT NOT NULL DEFAULT ''");
 addShotColumn("audio_mode", "TEXT NOT NULL DEFAULT 'generated'");
 addShotColumn("audio_asset_ids_json", "TEXT NOT NULL DEFAULT '[]'");
 addShotColumn("video_reference_media_ids_json", "TEXT NOT NULL DEFAULT '[]'");
+addShotColumn("voice_bindings_json", "TEXT NOT NULL DEFAULT '[]'");
 addShotColumn("speaker_map", "TEXT NOT NULL DEFAULT ''");
 addShotColumn("audio_direction", "TEXT NOT NULL DEFAULT ''");
 addShotColumn("lip_sync_notes", "TEXT NOT NULL DEFAULT ''");
 addShotColumn("approved_image_job_id", "TEXT");
 addShotColumn("approved_image_media_id", "TEXT");
 addShotColumn("approved_video_job_id", "TEXT");
+
+const generationJobColumns = db.prepare("PRAGMA table_info(generation_jobs)").all() as { name: string }[];
+if (!generationJobColumns.some((column) => column.name === "audio_asset_id")) db.exec("ALTER TABLE generation_jobs ADD COLUMN audio_asset_id TEXT");
+
+const audioAssetColumns = db.prepare("PRAGMA table_info(audio_assets)").all() as { name: string }[];
+const addAudioAssetColumn = (name: string, definition: string) => { if (!audioAssetColumns.some((column) => column.name === name)) db.exec(`ALTER TABLE audio_assets ADD COLUMN ${name} ${definition}`); };
+addAudioAssetColumn("status", "TEXT NOT NULL DEFAULT 'draft'");
+addAudioAssetColumn("version", "INTEGER NOT NULL DEFAULT 1");
+addAudioAssetColumn("source_job_id", "TEXT");
+addAudioAssetColumn("source_expires_at", "TEXT");
+addAudioAssetColumn("voice_profile_hash", "TEXT NOT NULL DEFAULT ''");
+addAudioAssetColumn("seedance_asset_url", "TEXT NOT NULL DEFAULT ''");
+addAudioAssetColumn("registration_job_id", "TEXT");
+addAudioAssetColumn("locked_at", "TEXT");
+
+if (!storeMigrationApplied("voice_anchors_v1")) {
+  const projects = db.prepare("SELECT id FROM projects").all() as Array<{ id: string }>;
+  const updateBindings = db.prepare("UPDATE shots SET voice_bindings_json=?,audio_mode=?,updated_at=? WHERE id=?");
+  for (const project of projects) {
+    const assets = (db.prepare("SELECT id,type,name,reference_code FROM assets WHERE project_id=?").all(project.id) as Array<{ id: string; type: Asset["type"]; name: string; reference_code: string }>).map((asset) => ({
+      id: asset.id, type: asset.type, name: asset.name, referenceCode: asset.reference_code
+    }));
+    const shots = db.prepare("SELECT id,dialogue,speaker_map,voice_bindings_json,audio_mode,approved_video_job_id FROM shots WHERE project_id=?").all(project.id) as Array<{
+      id: string; dialogue: string; speaker_map: string; voice_bindings_json: string; audio_mode: string; approved_video_job_id: string | null;
+    }>;
+    for (const shot of shots) {
+      if (!shot.dialogue.trim()) continue;
+      const existing = parseJson<Shot["voiceBindings"]>(shot.voice_bindings_json || "[]", []);
+      const bindings = inferShotVoiceBindings(shot.dialogue, shot.speaker_map, assets, existing);
+      const audioMode = !shot.approved_video_job_id && ["generated", "dialogue_lipsync", "silent"].includes(shot.audio_mode) ? "voice_reference" : shot.audio_mode;
+      updateBindings.run(asJson(bindings), audioMode, now(), shot.id);
+    }
+  }
+  db.prepare("INSERT INTO settings (key,value,updated_at) VALUES (?,?,?)").run("voice_anchors_v1", "speaker-bindings-created", now());
+}
 // Asset approvals originally stored only the job id. Promote the approved
 // job's local image to the canonical reference used everywhere downstream.
 db.exec(`
@@ -234,7 +282,8 @@ function shotFrom(row: Record<string, unknown>): Shot {
     plannedStartState: String(row.planned_start_state ?? ""), plannedEndState: String(row.planned_end_state ?? ""),
     alreadyHappened: String(row.already_happened ?? ""), reservedForLater: String(row.reserved_for_later ?? ""),
     continuityLocks: String(row.continuity_locks ?? ""), allowedChanges: String(row.allowed_changes ?? ""), status: row.status as Shot["status"],
-    audioMode: String(row.audio_mode ?? "generated") as Shot["audioMode"], audioAssetIds: parseJson(String(row.audio_asset_ids_json ?? "[]"), []), videoReferenceMediaIds: parseJson(String(row.video_reference_media_ids_json ?? "[]"), []),
+    audioMode: String(row.audio_mode ?? "generated") as Shot["audioMode"], audioAssetIds: parseJson(String(row.audio_asset_ids_json ?? "[]"), []),
+    voiceBindings: parseJson(String(row.voice_bindings_json ?? "[]"), []), videoReferenceMediaIds: parseJson(String(row.video_reference_media_ids_json ?? "[]"), []),
     speakerMap: String(row.speaker_map ?? ""), audioDirection: String(row.audio_direction ?? ""), lipSyncNotes: String(row.lip_sync_notes ?? ""),
     sampleApproved: Boolean(row.sample_approved), approvedImageJobId: row.approved_image_job_id ? String(row.approved_image_job_id) : null,
     approvedImageMediaId: row.approved_image_media_id ? String(row.approved_image_media_id) : null,
@@ -253,12 +302,25 @@ function audioClipFrom(row: Record<string, unknown>): AudioClip {
 
 function jobFrom(row: Record<string, unknown>): GenerationJob {
   return { id: String(row.id), projectId: String(row.project_id), shotId: row.shot_id ? String(row.shot_id) : null,
-    assetId: row.asset_id ? String(row.asset_id) : null, kind: row.kind as GenerationJob["kind"], provider: row.provider as GenerationJob["provider"],
+    assetId: row.asset_id ? String(row.asset_id) : null, audioAssetId: row.audio_asset_id ? String(row.audio_asset_id) : null,
+    kind: row.kind as GenerationJob["kind"], provider: row.provider as GenerationJob["provider"],
     model: String(row.model), prompt: String(row.prompt), params: parseJson(String(row.params_json), {}),
     externalTaskId: row.external_task_id ? String(row.external_task_id) : null, status: row.status as GenerationJob["status"],
     progress: Number(row.progress), cost: Number(row.cost), creditsCost: Number(row.credits_cost), output: parseJson(String(row.output_json), {}),
     error: String(row.error), attempt: Number(row.attempt), nextPollAt: row.next_poll_at ? String(row.next_poll_at) : null,
     createdAt: String(row.created_at), updatedAt: String(row.updated_at) };
+}
+
+function editJobFrom(row: Record<string, unknown>): EditJob {
+  return {
+    id: String(row.id), projectId: String(row.project_id), status: row.status as EditStatus,
+    adapter: String(row.adapter), cliPath: String(row.cli_path ?? ""),
+    manifestPath: String(row.manifest_path), planPath: String(row.plan_path), projectRoot: String(row.project_root ?? ""), outputPath: String(row.output_path),
+    version: Number(row.version), commandOutput: String(row.command_output ?? ""), error: String(row.error ?? ""),
+    qualityReport: row.quality_report_json ? parseJson<EditQualityReport | null>(String(row.quality_report_json), null) : null,
+    finalReviewStatus: row.final_review_status ? row.final_review_status as EditJob["finalReviewStatus"] : null,
+    exportedAt: row.exported_at ? String(row.exported_at) : null, createdAt: String(row.created_at), updatedAt: String(row.updated_at)
+  };
 }
 
 function codexImageRequestFrom(row: Record<string, unknown>): CodexImageRequest {
@@ -307,7 +369,7 @@ export const store = {
     db.exec("BEGIN");
     try {
       db.prepare("DELETE FROM audio_clips WHERE project_id=?").run(projectId);
-      for (const table of ["artifacts", "reviews", "assets", "shots", "prompt_versions", "generation_jobs", "codex_image_requests", "revision_requests", "media_files", "audio_assets"]) {
+      for (const table of ["artifacts", "reviews", "assets", "shots", "prompt_versions", "generation_jobs", "edit_jobs", "codex_image_requests", "revision_requests", "media_files", "audio_assets"]) {
         db.prepare(`DELETE FROM ${table} WHERE project_id=?`).run(projectId);
       }
       db.prepare("DELETE FROM projects WHERE id=?").run(projectId);
@@ -321,6 +383,11 @@ export const store = {
     if (fs.existsSync(previewDir)) for (const entry of fs.readdirSync(previewDir)) {
       const file = path.resolve(previewDir, entry);
       if (file.startsWith(previewPrefix)) { try { fs.rmSync(file, { force: true }); } catch { /* best effort */ } }
+    }
+    const deliveryProjectDir = path.resolve(deliveryRoot, projectId);
+    const deliverySafeRoot = `${path.resolve(deliveryRoot)}${path.sep}`;
+    if (deliveryProjectDir.startsWith(deliverySafeRoot) && fs.existsSync(deliveryProjectDir)) {
+      try { fs.rmSync(deliveryProjectDir, { recursive: true, force: true }); } catch { /* best effort */ }
     }
     return { projectId, deletedFiles: files.length };
   },
@@ -437,7 +504,8 @@ export const store = {
       plannedStartState: input.plannedStartState ?? previousShot?.plannedStartState ?? "", plannedEndState: input.plannedEndState ?? previousShot?.plannedEndState ?? "",
       alreadyHappened: input.alreadyHappened ?? previousShot?.alreadyHappened ?? "", reservedForLater: input.reservedForLater ?? previousShot?.reservedForLater ?? "",
       continuityLocks: input.continuityLocks ?? previousShot?.continuityLocks ?? "", allowedChanges: input.allowedChanges ?? previousShot?.allowedChanges ?? "",
-      audioMode: input.audioMode ?? previousShot?.audioMode ?? "generated", audioAssetIds: input.audioAssetIds ?? previousShot?.audioAssetIds ?? [], videoReferenceMediaIds: input.videoReferenceMediaIds ?? previousShot?.videoReferenceMediaIds ?? [],
+      audioMode: input.audioMode ?? previousShot?.audioMode ?? "generated", audioAssetIds: input.audioAssetIds ?? previousShot?.audioAssetIds ?? [],
+      voiceBindings: input.voiceBindings ?? previousShot?.voiceBindings ?? [], videoReferenceMediaIds: input.videoReferenceMediaIds ?? previousShot?.videoReferenceMediaIds ?? [],
       speakerMap: input.speakerMap ?? previousShot?.speakerMap ?? "", audioDirection: input.audioDirection ?? previousShot?.audioDirection ?? "",
       lipSyncNotes: input.lipSyncNotes ?? previousShot?.lipSyncNotes ?? "",
       status: input.status ?? previousShot?.status ?? "draft", sampleApproved: input.sampleApproved ?? previousShot?.sampleApproved ?? false,
@@ -453,26 +521,26 @@ export const store = {
         shot.dialogue !== previousShot.dialogue || shot.videoPrompt !== previousShot.videoPrompt || shot.parentShotId !== previousShot.parentShotId ||
         shot.sequenceRelation !== previousShot.sequenceRelation || shot.plannedStartState !== previousShot.plannedStartState || shot.plannedEndState !== previousShot.plannedEndState ||
         shot.alreadyHappened !== previousShot.alreadyHappened || shot.reservedForLater !== previousShot.reservedForLater || shot.continuityLocks !== previousShot.continuityLocks ||
-        shot.audioMode !== previousShot.audioMode || JSON.stringify(shot.audioAssetIds) !== JSON.stringify(previousShot.audioAssetIds) || JSON.stringify(shot.videoReferenceMediaIds) !== JSON.stringify(previousShot.videoReferenceMediaIds) ||
+        shot.audioMode !== previousShot.audioMode || JSON.stringify(shot.audioAssetIds) !== JSON.stringify(previousShot.audioAssetIds) || JSON.stringify(shot.voiceBindings) !== JSON.stringify(previousShot.voiceBindings) || JSON.stringify(shot.videoReferenceMediaIds) !== JSON.stringify(previousShot.videoReferenceMediaIds) ||
         shot.speakerMap !== previousShot.speakerMap || shot.audioDirection !== previousShot.audioDirection || shot.lipSyncNotes !== previousShot.lipSyncNotes;
       if (imageChanged) { shot.approvedImageJobId = null; shot.approvedImageMediaId = null; }
       if (videoChanged) { shot.approvedVideoJobId = null; shot.lastFrameMediaId = null; shot.observedEndState = ""; shot.observedAudioState = ""; shot.sampleApproved = false; }
       if (imageChanged || videoChanged) shot.status = "stale";
     }
     if (existing) {
-      db.prepare(`UPDATE shots SET shot_number=?,title=?,duration=?,narrative_purpose=?,composition=?,camera=?,action=?,dialogue=?,image_prompt=?,video_prompt=?,asset_ids_json=?,scene_id=?,parent_shot_id=?,sequence_relation=?,felt_intent=?,planned_start_state=?,planned_end_state=?,already_happened=?,reserved_for_later=?,continuity_locks=?,allowed_changes=?,audio_mode=?,audio_asset_ids_json=?,video_reference_media_ids_json=?,speaker_map=?,audio_direction=?,lip_sync_notes=?,status=?,sample_approved=?,approved_image_job_id=?,approved_image_media_id=?,approved_video_job_id=?,observed_end_state=?,observed_audio_state=?,last_frame_media_id=?,updated_at=? WHERE id=?`).run(
+      db.prepare(`UPDATE shots SET shot_number=?,title=?,duration=?,narrative_purpose=?,composition=?,camera=?,action=?,dialogue=?,image_prompt=?,video_prompt=?,asset_ids_json=?,scene_id=?,parent_shot_id=?,sequence_relation=?,felt_intent=?,planned_start_state=?,planned_end_state=?,already_happened=?,reserved_for_later=?,continuity_locks=?,allowed_changes=?,audio_mode=?,audio_asset_ids_json=?,voice_bindings_json=?,video_reference_media_ids_json=?,speaker_map=?,audio_direction=?,lip_sync_notes=?,status=?,sample_approved=?,approved_image_job_id=?,approved_image_media_id=?,approved_video_job_id=?,observed_end_state=?,observed_audio_state=?,last_frame_media_id=?,updated_at=? WHERE id=?`).run(
         shot.shotNumber, shot.title, shot.duration, shot.narrativePurpose, shot.composition, shot.camera, shot.action, shot.dialogue,
         shot.imagePrompt, shot.videoPrompt, asJson(shot.assetIds), shot.sceneId, shot.parentShotId, shot.sequenceRelation, shot.feltIntent,
         shot.plannedStartState, shot.plannedEndState, shot.alreadyHappened, shot.reservedForLater, shot.continuityLocks, shot.allowedChanges,
-        shot.audioMode, asJson(shot.audioAssetIds), asJson(shot.videoReferenceMediaIds), shot.speakerMap, shot.audioDirection, shot.lipSyncNotes,
+        shot.audioMode, asJson(shot.audioAssetIds), asJson(shot.voiceBindings), asJson(shot.videoReferenceMediaIds), shot.speakerMap, shot.audioDirection, shot.lipSyncNotes,
         shot.status, shot.sampleApproved ? 1 : 0, shot.approvedImageJobId, shot.approvedImageMediaId, shot.approvedVideoJobId, shot.observedEndState, shot.observedAudioState, shot.lastFrameMediaId, stamp, shot.id);
     } else {
-      db.prepare(`INSERT INTO shots (id,project_id,shot_number,title,duration,narrative_purpose,composition,camera,action,dialogue,image_prompt,video_prompt,asset_ids_json,status,sample_approved,observed_end_state,observed_audio_state,last_frame_media_id,scene_id,parent_shot_id,sequence_relation,felt_intent,planned_start_state,planned_end_state,already_happened,reserved_for_later,continuity_locks,allowed_changes,audio_mode,audio_asset_ids_json,video_reference_media_ids_json,speaker_map,audio_direction,lip_sync_notes,approved_image_job_id,approved_image_media_id,approved_video_job_id,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(shot.id, projectId, shot.shotNumber, shot.title, shot.duration,
+      db.prepare(`INSERT INTO shots (id,project_id,shot_number,title,duration,narrative_purpose,composition,camera,action,dialogue,image_prompt,video_prompt,asset_ids_json,status,sample_approved,observed_end_state,observed_audio_state,last_frame_media_id,scene_id,parent_shot_id,sequence_relation,felt_intent,planned_start_state,planned_end_state,already_happened,reserved_for_later,continuity_locks,allowed_changes,audio_mode,audio_asset_ids_json,voice_bindings_json,video_reference_media_ids_json,speaker_map,audio_direction,lip_sync_notes,approved_image_job_id,approved_image_media_id,approved_video_job_id,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(shot.id, projectId, shot.shotNumber, shot.title, shot.duration,
         shot.narrativePurpose, shot.composition, shot.camera, shot.action, shot.dialogue, shot.imagePrompt, shot.videoPrompt, asJson(shot.assetIds),
         shot.status, 0, shot.observedEndState, shot.observedAudioState, shot.lastFrameMediaId, shot.sceneId, shot.parentShotId, shot.sequenceRelation, shot.feltIntent,
         shot.plannedStartState, shot.plannedEndState, shot.alreadyHappened, shot.reservedForLater, shot.continuityLocks, shot.allowedChanges,
-        shot.audioMode, asJson(shot.audioAssetIds), asJson(shot.videoReferenceMediaIds), shot.speakerMap, shot.audioDirection, shot.lipSyncNotes,
+        shot.audioMode, asJson(shot.audioAssetIds), asJson(shot.voiceBindings), asJson(shot.videoReferenceMediaIds), shot.speakerMap, shot.audioDirection, shot.lipSyncNotes,
         shot.approvedImageJobId, shot.approvedImageMediaId, shot.approvedVideoJobId, stamp, stamp);
     }
     return shot;
@@ -494,11 +562,11 @@ export const store = {
       : db.prepare("UPDATE revision_requests SET status='resolved',resolved_at=? WHERE project_id=? AND target_type=? AND status!='resolved'").run(resolvedAt, projectId, targetType);
     return Number(result.changes);
   },
-  addJob(input: Omit<GenerationJob, "id" | "createdAt" | "updatedAt" | "status" | "progress" | "cost" | "creditsCost" | "output" | "error" | "attempt" | "externalTaskId" | "nextPollAt">) {
+  addJob(input: Omit<GenerationJob, "id" | "createdAt" | "updatedAt" | "status" | "progress" | "cost" | "creditsCost" | "output" | "error" | "attempt" | "externalTaskId" | "nextPollAt" | "audioAssetId"> & { audioAssetId?: string | null }) {
     const stamp = now();
-    const job: GenerationJob = { ...input, id: id("job"), externalTaskId: null, status: "draft", progress: 0, cost: 0, creditsCost: 0,
+    const job: GenerationJob = { ...input, audioAssetId: input.audioAssetId ?? null, id: id("job"), externalTaskId: null, status: "draft", progress: 0, cost: 0, creditsCost: 0,
       output: {}, error: "", attempt: 0, nextPollAt: null, createdAt: stamp, updatedAt: stamp };
-    db.prepare("INSERT INTO generation_jobs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(job.id, job.projectId, job.shotId, job.assetId,
+    db.prepare("INSERT INTO generation_jobs (id,project_id,shot_id,asset_id,audio_asset_id,kind,provider,model,prompt,params_json,external_task_id,status,progress,cost,credits_cost,output_json,error,attempt,next_poll_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(job.id, job.projectId, job.shotId, job.assetId, job.audioAssetId,
       job.kind, job.provider, job.model, job.prompt, asJson(job.params), job.externalTaskId, job.status, job.progress, job.cost, job.creditsCost,
       asJson(job.output), job.error, job.attempt, job.nextPollAt, stamp, stamp);
     return job;
@@ -511,6 +579,36 @@ export const store = {
     return job;
   },
   getJob(jobId: string) { return jobFrom(db.prepare("SELECT * FROM generation_jobs WHERE id=?").get(jobId) as Record<string, unknown>); },
+  createEditJob(input: Omit<EditJob, "id" | "createdAt" | "updatedAt">) {
+    const stamp = now();
+    const value: EditJob = { ...input, id: id("edit"), createdAt: stamp, updatedAt: stamp };
+    db.prepare("INSERT INTO edit_jobs (id,project_id,status,adapter,cli_path,manifest_path,plan_path,project_root,output_path,version,command_output,error,quality_report_json,final_review_status,exported_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      value.id, value.projectId, value.status, value.adapter, value.cliPath, value.manifestPath, value.planPath, value.projectRoot,
+      value.outputPath, value.version, value.commandOutput, value.error, value.qualityReport ? asJson(value.qualityReport) : null, value.finalReviewStatus,
+      value.exportedAt, value.createdAt, value.updatedAt);
+    return value;
+  },
+  getEditJob(editJobId: string) {
+    const row = db.prepare("SELECT * FROM edit_jobs WHERE id=?").get(editJobId) as Record<string, unknown> | undefined;
+    if (!row) throw new Error("剪辑任务不存在。");
+    return editJobFrom(row);
+  },
+  listEditJobs(projectId: string) {
+    return (db.prepare("SELECT * FROM edit_jobs WHERE project_id=? ORDER BY version DESC").all(projectId) as Record<string, unknown>[]).map(editJobFrom);
+  },
+  updateEditJob(editJobId: string, patch: Partial<EditJob>) {
+    const current = this.getEditJob(editJobId);
+    const value: EditJob = { ...current, ...patch, updatedAt: now() };
+    db.prepare("UPDATE edit_jobs SET status=?,adapter=?,cli_path=?,manifest_path=?,plan_path=?,project_root=?,output_path=?,version=?,command_output=?,error=?,quality_report_json=?,final_review_status=?,exported_at=?,updated_at=? WHERE id=?").run(
+      value.status, value.adapter, value.cliPath, value.manifestPath, value.planPath, value.projectRoot, value.outputPath, value.version,
+      value.commandOutput, value.error, value.qualityReport ? asJson(value.qualityReport) : null, value.finalReviewStatus, value.exportedAt, value.updatedAt, editJobId);
+    return value;
+  },
+  addMediaFile(input: Omit<MediaFile, "id" | "createdAt">) {
+    const value: MediaFile = { ...input, id: id("med"), createdAt: now() };
+    db.prepare("INSERT INTO media_files VALUES (?,?,?,?,?,?,?,?,?)").run(value.id, value.projectId, value.jobId, value.kind, value.localPath, value.sourceUrl, value.expiresAt, asJson(value.metadata), value.createdAt);
+    return value;
+  },
   addCodexImageRequest(input: Omit<CodexImageRequest, "id" | "status" | "resultJobId" | "error" | "createdAt" | "updatedAt" | "resolution"> & { resolution?: string }) {
     const stamp = now();
     const value: CodexImageRequest = { ...input, resolution: input.resolution ?? "1k", id: id("cximg"), status: "queued", resultJobId: null, error: "", createdAt: stamp, updatedAt: stamp };
@@ -548,11 +646,15 @@ export const store = {
         gate: r.gate as Review["gate"], decision: r.decision as Review["decision"], scores: parseJson(String(r.scores_json), {}), feedback: String(r.feedback), createdAt: String(r.created_at) })),
       assets: rows("assets").map(assetFrom), shots: (db.prepare("SELECT * FROM shots WHERE project_id=? ORDER BY shot_number").all(projectId) as Record<string, unknown>[]).map(shotFrom),
       jobs: rows("generation_jobs").map(jobFrom),
+      editJobs: this.listEditJobs(projectId),
       mediaFiles: rows("media_files").map((r) => ({ id: String(r.id), projectId: String(r.project_id), jobId: r.job_id ? String(r.job_id) : null,
         kind: r.kind as MediaFile["kind"], localPath: String(r.local_path), sourceUrl: String(r.source_url ?? ""), expiresAt: r.expires_at ? String(r.expires_at) : null, metadata: parseJson(String(r.metadata_json), {}), createdAt: String(r.created_at) })),
       audioAssets: rows("audio_assets").map((r) => ({ id: String(r.id), projectId: String(r.project_id), type: r.type as AudioAsset["type"], name: String(r.name),
         characterAssetId: r.character_asset_id ? String(r.character_asset_id) : null, localPath: String(r.local_path), remoteUrl: String(r.remote_url),
-        duration: Number(r.duration), rightsNote: String(r.rights_note), description: String(r.description), createdAt: String(r.created_at), updatedAt: String(r.updated_at) })),
+        duration: Number(r.duration), rightsNote: String(r.rights_note), description: String(r.description), status: r.status as AudioAsset["status"],
+        version: Number(r.version ?? 1), sourceJobId: r.source_job_id ? String(r.source_job_id) : null, sourceExpiresAt: r.source_expires_at ? String(r.source_expires_at) : null,
+        voiceProfileHash: String(r.voice_profile_hash ?? ""), seedanceAssetUrl: String(r.seedance_asset_url ?? ""), registrationJobId: r.registration_job_id ? String(r.registration_job_id) : null,
+        lockedAt: r.locked_at ? String(r.locked_at) : null, createdAt: String(r.created_at), updatedAt: String(r.updated_at) })),
       audioClips: (db.prepare("SELECT * FROM audio_clips WHERE project_id=? ORDER BY created_at DESC").all(projectId) as Record<string, unknown>[]).map(audioClipFrom),
       codexImageRequests: rows("codex_image_requests").map(codexImageRequestFrom),
       revisions: rows("revision_requests").map((r) => ({ id: String(r.id), projectId: String(r.project_id), targetType: r.target_type as "script", targetId: r.target_id ? String(r.target_id) : null,

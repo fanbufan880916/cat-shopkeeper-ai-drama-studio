@@ -6,7 +6,11 @@ import type { GenerationProvider, PollResult, SubmitResult } from "./types.js";
 const baseUrl = "https://api.apimart.ai";
 
 function generationPayload(job: GenerationJob) {
+  if (job.kind === "audio_registration") {
+    return { project_name: job.params.project_name, asset_type: "Audio", url: job.params.url };
+  }
   const payload: Record<string, unknown> = { model: job.model, prompt: job.prompt, ...job.params };
+  delete payload.voice_anchor_snapshot;
   if (job.kind === "image" && job.model === "midjourney") delete payload.model;
   if (job.kind === "image" && job.model === "gpt-image-2") {
     // The regular channel does not expose the official channel's quality field.
@@ -62,7 +66,7 @@ export class APIMartProvider implements GenerationProvider {
   }
 
   async submit(job: GenerationJob, apiKey: string): Promise<SubmitResult> {
-    const endpoint = job.kind === "image"
+    const endpoint = job.kind === "audio_registration" ? "/v1/seedance2/private-avatar" : job.kind === "image"
       ? job.model === "midjourney" ? "/v1/midjourney/generations" : "/v1/images/generations"
       : "/v1/videos/generations";
     const payload = generationPayload(job);
@@ -77,14 +81,17 @@ export class APIMartProvider implements GenerationProvider {
     const body = await request(apiKey, `/v1/tasks/${encodeURIComponent(job.externalTaskId)}`);
     const data = (body.data ?? body) as Record<string, unknown>;
     const rawStatus = String(data.status ?? "submitted");
-    const status = rawStatus === "completed" ? "completed" : rawStatus === "failed" ? "failed" : rawStatus === "processing" || rawStatus === "in_progress" ? "processing" : "submitted";
+    const output = data.result ?? {};
+    const usableAssets = (output as { usable_assets?: unknown[] }).usable_assets;
+    const status = rawStatus === "completed" || (job.kind === "audio_registration" && Array.isArray(usableAssets) && usableAssets.length > 0)
+      ? "completed" : rawStatus === "failed" ? "failed" : rawStatus === "processing" || rawStatus === "in_progress" ? "processing" : "submitted";
     const errorData = data.error as { message?: string } | undefined;
     return {
       status,
       progress: Number(data.progress ?? (status === "completed" ? 100 : 0)),
       cost: Number(data.cost ?? 0),
       creditsCost: Number(data.credits_cost ?? 0),
-      output: data.result ?? {},
+      output,
       error: errorData?.message ?? ""
     };
   }

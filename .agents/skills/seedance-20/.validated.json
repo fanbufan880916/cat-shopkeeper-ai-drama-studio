@@ -6,5 +6,5 @@
     "checksum":  "8b78186b264c13e69a59d7060f523a90416c9ac033da7db41e182231f630aa4f",
     "valid":  true,
     "details":  "Vendored upstream snapshot. Full v6.6 validation suite passed: structure, content, schemas, sources, state, continuity, sequence, behavior, generation, lint, unit tests and compile checks.",
-    "updatedAt":  "2026-07-16T12:14:12.3956282Z"
+    "updatedAt":  "2026-07-17T14:42:46.3967282Z"
 }

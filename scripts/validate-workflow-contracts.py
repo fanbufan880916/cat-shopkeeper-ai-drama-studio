@@ -24,7 +24,9 @@ EXPECTED_MCP_TOOLS = {
     "save_artifact_version", "submit_internal_review", "upsert_asset", "upsert_shot",
     "list_open_revisions", "list_pending_codex_image_requests", "claim_codex_image_request",
     "complete_codex_image_request", "fail_codex_image_request", "resolve_revision",
-    "get_skill_status",
+    "get_skill_status", "prepare_edit_manifest",
+    "configure_jianying", "check_jianying_cli", "run_jianying_edit", "get_jianying_edit_status",
+    "inspect_edit_output", "approve_final_edit", "reject_final_edit", "cancel_jianying_edit",
 }
 
 
@@ -72,6 +74,42 @@ def main() -> int:
     for stale in ("`submit_review`", "`list_assets`", "`update_asset`", "`create_shot`", "`update_shot`", "`submit_job`", "`poll_job`", "`list_codex_image_requests`"):
         if stale in workflow:
             errors.append(f"WORKFLOW 仍包含失效工具名：{stale}")
+
+    for phrase in ("`voiceBindings`", "`asset://`", "--kind voice-anchor", "镜头首帧退回", "不提供后期配音兜底"):
+        if phrase not in workflow:
+            errors.append(f"WORKFLOW 缺少音色锚点/首帧返工契约：{phrase}")
+
+    route_source = (ROOT / "server" / "routes.ts").read_text(encoding="utf-8")
+    for endpoint in (
+        "/api/audio-assets/:audioId/lock-impact",
+        "/api/audio-assets/:audioId/lock-voice",
+        "/api/audio-assets/:audioId/register-seedance",
+        "/api/shots/:shotId/image-revision",
+    ):
+        if endpoint not in route_source:
+            errors.append(f"服务端缺少已登记接口：{endpoint}")
+
+    shared_types = (ROOT / "shared" / "types.ts").read_text(encoding="utf-8")
+    for symbol in ("AudioAssetStatus", "ShotVoiceBinding", "voiceBindings", '"audio_registration"'):
+        if symbol not in shared_types:
+            errors.append(f"共享类型缺少音色锚点契约：{symbol}")
+
+    audio_lint = (ROOT / ".agents" / "skills" / "doubao-audio-generation" / "scripts" / "prompt_lint.py").read_text(encoding="utf-8")
+    for phrase in ("voice-anchor", "无音乐", "无环境声", "无音效", "无混响"):
+        if phrase not in audio_lint:
+            errors.append(f"豆包音频lint缺少音色锚点规则：{phrase}")
+
+    searchable_roots = [ROOT / "server", ROOT / "shared", ROOT / "src", ROOT / "scripts", ROOT / "docs", ROOT / ".codex", ROOT / ".agents"]
+    searchable_files = [ROOT / "WORKFLOW.md", ROOT / "AGENTS.md"]
+    for directory in searchable_roots:
+        searchable_files.extend(path for path in directory.rglob("*") if path.is_file() and path.suffix.lower() in {".ts", ".tsx", ".md", ".toml", ".py", ".ps1", ".json"})
+    for path in searchable_files:
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if re.search(r"lib[ -]?tv", content, re.IGNORECASE):
+            errors.append(f"发现误留的旧系统引用：{path.relative_to(ROOT)}")
 
     if errors:
         print("workflow contract validation: FAIL")

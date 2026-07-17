@@ -14,6 +14,8 @@ export interface NavigationCompletion {
 }
 
 const stageActions: Record<WorkflowStage, StageAction> = {
+  edit_prepare: { section: "preview", label: "生成剪辑清单", description: "根据已通过镜头生成版本化剪辑方案和剪辑清单。" },
+  edit_render: { section: "preview", label: "调用剪映导出", description: "使用配置好的剪映 CLI 导出成片并进行技术质检。" },
   idea: { section: "script", label: "进入剧本准备", description: "先让编剧 Agent 产出第一版剧本。" },
   script_internal_review: { section: "script", label: "查看内部审核", description: "查看总导演与观众 Agent 的审核进度。" },
   script_user_review: { section: "script", label: "审阅剧本", description: "确认当前剧本，或写明具体意见退回修改。" },

@@ -3,12 +3,12 @@ import path from "node:path";
 import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 import multipart from "@fastify/multipart";
-import { dataDir, mediaDir, previewDir, rootDir, uploadDir } from "./paths.js";
+import { dataDir, deliveryRoot, mediaDir, previewDir, rootDir, uploadDir } from "./paths.js";
 import { registerRoutes } from "./routes.js";
 import { refreshSkillStatus } from "./skills.js";
 import { startWorker, stopWorker } from "./worker.js";
 
-for (const dir of [dataDir, mediaDir, previewDir, uploadDir]) fs.mkdirSync(dir, { recursive: true });
+for (const dir of [dataDir, mediaDir, previewDir, uploadDir, deliveryRoot]) fs.mkdirSync(dir, { recursive: true });
 refreshSkillStatus();
 
 const app = Fastify({ logger: { level: process.env.NODE_ENV === "test" ? "silent" : "info", redact: ["req.headers.authorization", "body.apiKey"] } });
